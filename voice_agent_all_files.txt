@@ -1,0 +1,3500 @@
+================================================================================
+APTUS AI VOICE AGENT - COMPLETE SOURCE CODE BUNDLE
+================================================================================
+
+TABLE OF CONTENTS:
+  01. frontend/src/voice/speaker.js - Frontend TTS Player (Google Cloud Web Audio API & Interruption Engine)
+  02. frontend/src/voice/listener.js - Frontend STT Listener (MediaRecorder & Groq Whisper Dispatcher)
+  03. frontend/src/voice/interviewAgent.js - Frontend Voice Agent Finite State Machine (FSM) Orchestrator
+  04. frontend/src/hooks/useInterviewAgent.js - Frontend React Hook Bridge for Voice Agent
+  05. frontend/src/components/InterviewAgentScreen.jsx - Frontend Voice Interview Room UI Component
+  06. frontend/src/components/VoiceOrb.jsx - Frontend Voice Orb Sound Reactive Visualizer Component
+  07. frontend/src/api.js - Frontend HTTP Client for TTS, STT & Interview Flow
+  08. backend/app/core/gemini.py - Backend AI Engine (Groq Whisper STT, Google Cloud TTS, Gemini 2.5 Flash)
+  09. backend/app/adapters/modality.py - Backend Modality Adapters (VoiceAdapter & TextAdapter)
+  10. backend/app/api/routes.py - Backend FastAPI HTTP Routes (/api/tts, /api/stt, /api/sessions)
+  11. backend/app/graph/state.py - Backend State Models (Turn, InterviewState, InsightEntry)
+  12. backend/app/config.py - Backend System Configuration & Credentials Loader
+
+================================================================================
+
+================================================================================
+FILE 01/12: frontend/src/voice/speaker.js
+DESCRIPTION: Frontend TTS Player (Google Cloud Web Audio API & Interruption Engine)
+================================================================================
+
+// frontend/src/voice/speaker.js
+// High-fidelity Google Cloud TTS player powered by Web Audio API.
+import { synthesizeSpeech } from '../api';
+
+let audioQueue = [];
+let isPlaying = false;
+let globalAudioCtx = null;
+let currentSourceNode = null;
+let currentAudioElement = null;
+let currentUtterance = null;
+const activeUtterances = new Set();
+
+function getAudioContext() {
+  if (typeof window === 'undefined') return null;
+  if (!globalAudioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      globalAudioCtx = new AudioCtx();
+    }
+  }
+  if (globalAudioCtx && globalAudioCtx.state === 'suspended') {
+    globalAudioCtx.resume().catch(() => {});
+  }
+  return globalAudioCtx;
+}
+
+function sanitizeTextForSpeech(text) {
+  if (!text) return '';
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '$1')       // bold
+    .replace(/\*(.*?)\*/g, '$1')           // italic
+    .replace(/`{1,3}[^`]*`{1,3}/g, '')     // code blocks
+    .replace(/#+\s*/g, '')                 // headings
+    .replace(/\[(.*?)\]\(.*?\)/g, '$1')    // links
+    .replace(/[-*]\s+/g, '')               // list bullets
+    .replace(/\s+/g, ' ')                  // normalize whitespace
+    .trim();
+}
+
+/**
+ * Synthesizes and plays speech using Google Cloud TTS backend endpoint via Web Audio API.
+ */
+async function cloudTTS(text, { onStart, onEnd } = {}) {
+  const cleanText = sanitizeTextForSpeech(text);
+  if (!cleanText) return;
+
+  const startTime = Date.now();
+  console.log(`%c[TTS][Google Cloud] Synthesizing speech: "${cleanText.slice(0, 70)}..."`, 'color: #8b5cf6; font-weight: bold;');
+
+  try {
+    const audioBlob = await synthesizeSpeech(cleanText);
+    const audioCtx = getAudioContext();
+
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      return new Promise((resolve) => {
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        currentSourceNode = source;
+
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #10b981;');
+          if (currentSourceNode === source) {
+            currentSourceNode = null;
+          }
+          onEnd?.();
+          resolve();
+        };
+
+        source.onended = finish;
+
+        console.log(`%c[TTS][Google Cloud] Playing audio stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+        onStart?.();
+        source.start(0);
+      });
+    } else {
+      // HTML5 Audio fallback if AudioContext is unsupported
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      currentAudioElement = audio;
+
+      return new Promise((resolve) => {
+        audio.onplay = () => {
+          console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+          onStart?.();
+        };
+
+        const finish = () => {
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #a78bfa;');
+          URL.revokeObjectURL(audioUrl);
+          if (currentAudioElement === audio) {
+            currentAudioElement = null;
+          }
+          onEnd?.();
+          resolve();
+        };
+
+        audio.onended = finish;
+        audio.onerror = (e) => {
+          console.warn('[TTS][Google Cloud] Audio playback error:', e);
+          finish();
+        };
+
+        audio.play().catch((err) => {
+          console.warn('[TTS][Google Cloud] Audio play() prevented:', err);
+          finish();
+        });
+      });
+    }
+  } catch (err) {
+    console.error('[TTS][Google Cloud] Synthesis error:', err);
+    onEnd?.();
+  }
+}
+
+function getPreferredVoice() {
+  if (typeof window === 'undefined' || !window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || voices.length === 0) return null;
+
+  return (
+    voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Ava') || v.name.includes('Jenny'))) ||
+    voices.find(v => v.lang.startsWith('en') && (v.name.includes('Zira') || v.name.includes('David') || v.name.includes('Daniel'))) ||
+    voices.find(v => v.lang.startsWith('en')) ||
+    voices[0]
+  );
+}
+
+function browserTTS(text, { onStart, onEnd, rate = 1.0, pitch = 1.0 } = {}) {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      resolve();
+      return;
+    }
+
+    const cleanText = sanitizeTextForSpeech(text);
+    if (!cleanText) {
+      resolve();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    currentUtterance = utterance;
+    activeUtterances.add(utterance);
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length === 0) {
+      let resolved = false;
+      const handleVoices = () => {
+        if (resolved) return;
+        resolved = true;
+        window.speechSynthesis.removeEventListener('voiceschanged', handleVoices);
+        executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+      };
+      window.speechSynthesis.addEventListener('voiceschanged', handleVoices);
+
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          window.speechSynthesis.removeEventListener('voiceschanged', handleVoices);
+          executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+        }
+      }, 500);
+    } else {
+      executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+    }
+  });
+}
+
+function executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText }) {
+  const preferredVoice = getPreferredVoice();
+  if (preferredVoice) {
+    utterance.voice = preferredVoice;
+  }
+  utterance.lang = 'en-US';
+  utterance.rate = rate;
+  utterance.pitch = pitch;
+
+  let finished = false;
+  let watchdog = null;
+
+  const cleanup = () => {
+    if (watchdog) {
+      clearTimeout(watchdog);
+      watchdog = null;
+    }
+    activeUtterances.delete(utterance);
+    if (currentUtterance === utterance) {
+      currentUtterance = null;
+    }
+  };
+
+  const finishSpeech = () => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    onEnd?.();
+    resolve();
+  };
+
+  let startTime = Date.now();
+  utterance.onstart = () => {
+    startTime = Date.now();
+    console.log(`%c[TTS] Speaking (${preferredVoice?.name || 'Default'}): "${cleanText.slice(0, 80)}${cleanText.length > 80 ? '...' : ''}"`, 'color: #8b5cf6; font-weight: bold;');
+    onStart?.();
+  };
+
+  utterance.onend = () => {
+    const elapsed = Date.now() - startTime;
+    console.log(`%c[TTS] Finished playback in ${elapsed}ms`, 'color: #a78bfa;');
+    finishSpeech();
+  };
+
+  utterance.onerror = (e) => {
+    console.warn('[TTS] Synthesis event error/cancel:', e);
+    finishSpeech();
+  };
+
+  const words = (cleanText || '').split(/\s+/).length;
+  const estimatedMs = Math.max(4000, (words / 2.5) * 1000 + 4000);
+  watchdog = setTimeout(() => {
+    if (!finished) {
+      console.warn('[TTS] Watchdog timeout reached; resolving speech item.');
+      finishSpeech();
+    }
+  }, estimatedMs);
+
+  try {
+    window.speechSynthesis.speak(utterance);
+  } catch (err) {
+    console.error('[TTS] Speech call failed:', err);
+    finishSpeech();
+  }
+}
+
+async function processQueue() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    return;
+  }
+  isPlaying = true;
+  const nextItem = audioQueue.shift();
+  if (nextItem) {
+    await nextItem();
+  }
+  processQueue();
+}
+
+export function speakText(text, options = {}) {
+  return new Promise((resolve) => {
+    audioQueue.push(async () => {
+      await cloudTTS(text, options);
+      resolve();
+    });
+
+    if (!isPlaying) {
+      processQueue();
+    }
+  });
+}
+
+export function stopAudio() {
+  audioQueue = [];
+  activeUtterances.clear();
+  if (currentSourceNode) {
+    try {
+      currentSourceNode.stop();
+      currentSourceNode.disconnect();
+    } catch (e) {
+      // ignore
+    }
+    currentSourceNode = null;
+  }
+  if (currentAudioElement) {
+    try {
+      currentAudioElement.pause();
+      currentAudioElement.currentTime = 0;
+    } catch (e) {
+      // ignore
+    }
+    currentAudioElement = null;
+  }
+  if (typeof window !== 'undefined' && window.speechSynthesis) {
+    window.speechSynthesis.cancel();
+  }
+  isPlaying = false;
+  currentUtterance = null;
+}
+
+export function isAudioPlaying() {
+  return isPlaying || Boolean(currentSourceNode) || (typeof window !== 'undefined' && window.speechSynthesis?.speaking);
+}
+
+
+
+
+================================================================================
+FILE 02/12: frontend/src/voice/listener.js
+DESCRIPTION: Frontend STT Listener (MediaRecorder & Groq Whisper Dispatcher)
+================================================================================
+
+// frontend/src/voice/listener.js
+// Universal Voice Listener with MediaRecorder audio capture, Groq Whisper STT, and live visualizer.
+import { transcribeAudio } from '../api';
+
+export class VoiceListener {
+  constructor(options = {}) {
+    this.options = {
+      lang: 'en-US',
+      continuous: true,
+      interimResults: true,
+      silenceTimeoutMs: 2800, // auto-VAD silence detection threshold
+      autoVAD: true,
+      ...options
+    };
+
+    this.recognition = null;
+    this.mediaStream = null;
+    this.mediaRecorder = null;
+    this.audioChunks = [];
+    this.audioContext = null;
+    this.analyser = null;
+    this.animationFrameId = null;
+
+    this.isRecording = false;
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.silenceTimer = null;
+    this.hasSpoken = false;
+
+    // Callbacks
+    this.onInterim = null;
+    this.onFinal = null;
+    this.onVolume = null;
+    this.onSilence = null;
+    this.onError = null;
+    this.onStart = null;
+    this.onEnd = null;
+  }
+
+  /**
+   * Supported on ALL modern browsers with microphone access.
+   */
+  static isSupported() {
+    return typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices?.getUserMedia);
+  }
+
+  async start() {
+    if (this.isRecording) return;
+
+    this._cleanupAudioAnalyser();
+    this.audioChunks = [];
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.hasSpoken = false;
+
+    try {
+      // 1. Capture microphone audio stream
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+
+      // 2. Start MediaRecorder for backend Groq Whisper STT
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4');
+
+      this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType });
+      this.audioChunks = [];
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          this.audioChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.start(250); // Slice into 250ms chunks
+
+      // 3. Start AudioContext analyser for live volume visualizer
+      await this._startAudioAnalyser();
+
+      // 4. Optional parallel Web Speech API for live interim subtitle preview (if browser supports it)
+      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRec) {
+        try {
+          this.recognition = new SpeechRec();
+          this.recognition.continuous = this.options.continuous;
+          this.recognition.interimResults = this.options.interimResults;
+          this.recognition.lang = this.options.lang;
+
+          this.recognition.onresult = (event) => {
+            let finalStr = '';
+            let interimStr = '';
+
+            for (let i = 0; i < event.results.length; ++i) {
+              const item = event.results[i];
+              if (item.isFinal) {
+                finalStr += item[0].transcript + ' ';
+              } else {
+                interimStr += item[0].transcript;
+              }
+            }
+
+            this.finalTranscript = finalStr.trim();
+            this.interimTranscript = interimStr.trim();
+            this.hasSpoken = Boolean(this.finalTranscript || this.interimTranscript);
+
+            const currentFull = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
+            if (currentFull) {
+              console.log(`%c[STT] Interim preview: "${currentFull}"`, 'color: #06b6d4;');
+              this.onInterim?.(currentFull);
+            }
+
+            if (this.options.autoVAD && this.hasSpoken) {
+              this._resetSilenceTimer();
+            }
+          };
+
+          this.recognition.onerror = (e) => {
+            if (e.error !== 'no-speech') {
+              console.warn('[STT] Browser recognition notice:', e.error);
+            }
+          };
+
+          this.recognition.start();
+        } catch (e) {
+          console.warn('[STT] Browser SpeechRecognition unavailable, using pure MediaRecorder:', e);
+        }
+      }
+
+      this.isRecording = true;
+      console.log('%c[STT] Microphone recording active (Groq Whisper ready)...', 'color: #10b981; font-weight: bold;');
+      this.onStart?.();
+
+    } catch (err) {
+      console.error('[STT] Failed to acquire microphone stream:', err);
+      this._cleanupAudioAnalyser();
+      this.isRecording = false;
+      this.onError?.(err);
+      throw err;
+    }
+  }
+
+  async stop() {
+    if (!this.isRecording) return this.finalTranscript;
+
+    this.isRecording = false;
+    this._clearSilenceTimer();
+
+    if (this.recognition) {
+      try {
+        this.recognition.stop();
+      } catch (e) {}
+      this.recognition = null;
+    }
+
+    console.log('%c[STT] Stopped recording. Processing audio with Groq Whisper...', 'color: #3b82f6; font-weight: bold;');
+
+    let finalResultText = this.finalTranscript;
+
+    // Compile recorded audio chunks into a Blob
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      await new Promise((resolve) => {
+        this.mediaRecorder.onstop = resolve;
+        try {
+          this.mediaRecorder.stop();
+        } catch (e) {
+          resolve();
+        }
+      });
+    }
+
+    if (this.audioChunks.length > 0) {
+      const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
+      const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+
+      if (audioBlob.size > 2000) { // More than 2KB of audio
+        try {
+          console.log(`%c[STT][Groq Whisper] Uploading ${audioBlob.size} bytes for transcription...`, 'color: #8b5cf6;');
+          const sttData = await transcribeAudio(audioBlob);
+          if (sttData && sttData.text && sttData.text.trim()) {
+            finalResultText = sttData.text.trim();
+            console.log(`%c[STT][Groq Whisper] Transcribed: "${finalResultText}" (Confidence: ${sttData.confidence})`, 'color: #10b981; font-weight: bold;');
+          }
+        } catch (err) {
+          console.warn('[STT][Groq Whisper] Backend STT error, using local transcript fallback:', err);
+        }
+      }
+    }
+
+    this._cleanupAudioAnalyser();
+    this.onEnd?.();
+
+    if (finalResultText) {
+      this.onFinal?.(finalResultText);
+    }
+
+    return finalResultText;
+  }
+
+  resetTranscript() {
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.audioChunks = [];
+    this.hasSpoken = false;
+    this._clearSilenceTimer();
+  }
+
+  _resetSilenceTimer() {
+    this._clearSilenceTimer();
+    this.silenceTimer = setTimeout(async () => {
+      if (this.isRecording && this.hasSpoken) {
+        const fullText = await this.stop();
+        if (fullText && fullText.length > 2) {
+          this.onSilence?.(fullText);
+        }
+      }
+    }, this.options.silenceTimeoutMs);
+  }
+
+  _clearSilenceTimer() {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
+  async _startAudioAnalyser() {
+    try {
+      if (!this.mediaStream) return;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+
+      this.audioContext = new AudioCtx();
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 256;
+      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+      source.connect(this.analyser);
+
+      const bufferLength = this.analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      const updateVolume = () => {
+        if (!this.isRecording || !this.analyser) return;
+
+        this.analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          sum += dataArray[i];
+        }
+        const avg = sum / bufferLength;
+        const volume = Math.min(1.0, avg / 128); // Normalize 0.0 to 1.0
+
+        if (volume > 0.08) {
+          this.hasSpoken = true;
+          if (this.options.autoVAD) {
+            this._resetSilenceTimer();
+          }
+        }
+
+        this.onVolume?.(volume);
+        this.animationFrameId = requestAnimationFrame(updateVolume);
+      };
+
+      this.animationFrameId = requestAnimationFrame(updateVolume);
+    } catch (err) {
+      console.warn('[STT] Mic volume analyser notice:', err);
+    }
+  }
+
+  _cleanupAudioAnalyser() {
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach(track => track.stop());
+      this.mediaStream = null;
+    }
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
+    }
+    this.analyser = null;
+    this.onVolume?.(0);
+  }
+}
+
+
+
+================================================================================
+FILE 03/12: frontend/src/voice/interviewAgent.js
+DESCRIPTION: Frontend Voice Agent Finite State Machine (FSM) Orchestrator
+================================================================================
+
+// frontend/src/voice/interviewAgent.js
+// Production-grade 12-state interview agent architecture for technical screening.
+// Pure JS class — no React dependencies. Wired to React via useInterviewAgent.js
+
+import { speakText, stopAudio } from './speaker';
+import { VoiceListener } from './listener';
+
+// ─── State Definitions ────────────────────────────────────────────────────────
+
+export const S = {
+  IDLE:                'IDLE',
+  PLANNING_INTERVIEW:  'PLANNING_INTERVIEW',
+  SPEAKING:            'SPEAKING',
+  AWAITING_RESPONSE:   'AWAITING_RESPONSE',
+  INTERRUPTED:         'INTERRUPTED',
+  PROCESSING:          'PROCESSING',
+  CLARIFYING:          'CLARIFYING',
+  RECOVERING:          'RECOVERING',
+  WRAPPING_UP:         'WRAPPING_UP',
+  COMPLETE:            'COMPLETE',
+  ERROR:               'ERROR',
+  PAUSED:              'PAUSED',
+};
+
+const TRANSITIONS = {
+  [S.IDLE]:               [S.PROCESSING, S.PLANNING_INTERVIEW, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PLANNING_INTERVIEW]: [S.SPEAKING, S.WRAPPING_UP, S.ERROR, S.IDLE],
+  [S.SPEAKING]:           [S.PROCESSING, S.AWAITING_RESPONSE, S.INTERRUPTED, S.WRAPPING_UP, S.ERROR, S.PAUSED, S.IDLE],
+  [S.AWAITING_RESPONSE]:  [S.PROCESSING, S.CLARIFYING, S.SPEAKING, S.WRAPPING_UP, S.PAUSED, S.ERROR, S.IDLE],
+  [S.INTERRUPTED]:        [S.PROCESSING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PROCESSING]:         [S.SPEAKING, S.WRAPPING_UP, S.RECOVERING, S.ERROR, S.AWAITING_RESPONSE],
+  [S.CLARIFYING]:         [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.RECOVERING]:         [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.WRAPPING_UP]:        [S.COMPLETE, S.SPEAKING],
+  [S.COMPLETE]:           [S.IDLE],
+  [S.ERROR]:              [S.PROCESSING, S.RECOVERING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PAUSED]:             [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+};
+
+const RESPONSE_TIMEOUT_MS = 90_000; // 90s — candidate given generous time
+const MAX_LOG = 30;
+const MAX_LISTENER_RESTARTS = 5;
+const SILENCE_TIMEOUT_MS = 2800;
+const POST_TTS_GUARD_MS = 300; // Delay before opening mic to prevent acoustic echo feedback
+
+// ─── State Machine ────────────────────────────────────────────────────────────
+
+class StateMachine {
+  constructor() {
+    this._current = { state: S.IDLE, message: 'Ready', timestamp: Date.now() };
+    this._log = [];
+    this._waitTimer = null;
+
+    // Hooks
+    this.onChange = null;      // (snapshot) => void
+    this.onExitBusy = null;    // () => void — called when leaving SPEAKING/PROCESSING
+    this.onWaitTimeout = null; // () => void — called when AWAITING_RESPONSE times out
+  }
+
+  get state() { return this._current.state; }
+  get current() { return this._current; }
+  get log() { return this._log; }
+
+  transition(to, message = '', extra = {}) {
+    const from = this._current.state;
+
+    // Self-transition: just update message, no hooks
+    if (from === to && to !== S.IDLE) {
+      if (message) {
+        this._current = { ...this._current, message, timestamp: Date.now(), ...extra };
+        this.onChange?.(this._current);
+      }
+      return this._current;
+    }
+
+    const allowed = TRANSITIONS[from] || [];
+    if (!allowed.includes(to)) {
+      console.warn(`[InterviewAgent FSM] Invalid transition: ${from} → ${to}. Allowed: [${allowed.join(', ')}]`);
+      return null;
+    }
+
+    // Exit-busy hook: leaving SPEAKING or PROCESSING
+    if ((from === S.SPEAKING || from === S.PROCESSING) && to !== S.SPEAKING && to !== S.PROCESSING) {
+      this.onExitBusy?.();
+    }
+
+    // Clear response timeout when leaving AWAITING_RESPONSE
+    if (from === S.AWAITING_RESPONSE) {
+      this._clearWaitTimer();
+    }
+
+    this._log.push({ from, to, message, timestamp: Date.now() });
+    if (this._log.length > MAX_LOG) this._log.shift();
+
+    this._current = { state: to, message: message || to, timestamp: Date.now(), ...extra };
+    this.onChange?.(this._current);
+
+    // Start response timeout on AWAITING_RESPONSE
+    if (to === S.AWAITING_RESPONSE) {
+      this._startWaitTimer();
+    }
+
+    return this._current;
+  }
+
+  reset(message = 'Reset') {
+    this._clearWaitTimer();
+    this._current = { state: S.IDLE, message, timestamp: Date.now() };
+    this.onChange?.(this._current);
+  }
+
+  _startWaitTimer() {
+    this._clearWaitTimer();
+    this._waitTimer = setTimeout(() => {
+      if (this.state === S.AWAITING_RESPONSE) {
+        this.onWaitTimeout?.();
+      }
+    }, RESPONSE_TIMEOUT_MS);
+  }
+
+  _clearWaitTimer() {
+    if (this._waitTimer) {
+      clearTimeout(this._waitTimer);
+      this._waitTimer = null;
+    }
+  }
+}
+
+// ─── Plan Synthesizer ─────────────────────────────────────────────────────────
+
+export function synthesizeInterviewPlan(session, candidateName, role, resumeText = '') {
+  const name = candidateName || session?.candidate_name || 'there';
+  const topics = session?.topics_planned || [];
+
+  // Build todos from planned topics
+  const todos = topics.map((t, i) => {
+    const areaName = typeof t === 'string' ? t : (t.topic || `Topic ${i + 1}`);
+    const reasoning = typeof t === 'object' && t.reasoning ? t.reasoning : `Assess candidate depth in ${areaName}`;
+    return {
+      id: `t${i}`,
+      area: areaName,
+      intent: reasoning,
+      status: 'pending',      // 'pending' | 'covered' | 'skipped'
+      priority: i < 2 ? 'high' : 'medium',
+      attempts: 0,
+    };
+  });
+
+  const resumeSnippet = resumeText ? ` I've reviewed your background.` : '';
+
+  return {
+    candidateName: name,
+    role,
+    greeting: `Hi ${name}, welcome to your ${role} screening interview.${resumeSnippet} We'll have a technical discussion covering your background and core engineering principles. Ready to begin?`,
+    todos,
+    closing: `Thank you so much for your time today, ${name}. That concludes our screening session. We are compiling your performance evaluation now.`,
+    resumeContext: resumeText.slice(0, 800),
+  };
+}
+
+// ─── Main Agent Class ─────────────────────────────────────────────────────────
+
+export class InterviewAgent {
+  constructor({ session, candidateName, role, resumeText, currentQuestion, onSubmitAnswer, onComplete }) {
+    this.machine = new StateMachine();
+    this.session = session;
+    this.candidateName = candidateName;
+    this.role = role;
+    this.resumeText = resumeText;
+    this.currentQuestion = currentQuestion || null;
+    this._onSubmitAnswer = onSubmitAnswer;   // (questionId, answerText) => Promise<result>
+    this._onComplete = onComplete;           // () => void
+
+    this.plan = null;
+    this.conversationHistory = [];  // [{ role: 'interviewer'|'candidate', text, timestamp }]
+    this.abortController = null;
+    this.listenerRestarts = 0;
+    this.isSubmitting = false;
+
+    // Listener instance (single, reused)
+    this.listener = new VoiceListener({ silenceTimeoutMs: SILENCE_TIMEOUT_MS, autoVAD: true });
+    this._wireListener();
+
+    // Machine hooks
+    this.machine.onExitBusy = () => {
+      stopAudio();
+    };
+
+    this.machine.onWaitTimeout = async () => {
+      // Candidate silent for 90s — gentle prompt
+      await this._speakAndTransition(
+        'Just checking in — take your time. Would you like me to clarify the question, or would you like to continue?',
+        S.AWAITING_RESPONSE,
+        'Still listening...'
+      );
+    };
+
+    // Public callbacks (wired by hook)
+    this.onChange = null;        // (snapshot) => void
+    this.onPlanChange = null;    // (plan) => void
+    this.onHistoryChange = null; // (history) => void
+    this.onVolume = null;        // (level: 0-1) => void
+    this.onLiveTranscript = null; // (text) => void
+    this.onError = null;         // (msg) => void
+  }
+
+  // ── Public API ──────────────────────────────────────────────────────────────
+
+  get state() { return this.machine.state; }
+  get snapshot() { return this.machine.current; }
+  get isSupported() { return VoiceListener.isSupported(); }
+  get isListening() { return Boolean(this.listener?.isListening); }
+
+  /** Kick off the interview. Call once after mount. */
+  async start() {
+    if (this.machine.state !== S.IDLE) return;
+    this.machine.onChange = (snap) => this.onChange?.(snap);
+
+    this.machine.transition(S.PLANNING_INTERVIEW, 'Preparing your interview...');
+
+    try {
+      this.plan = synthesizeInterviewPlan(this.session, this.candidateName, this.role, this.resumeText);
+      this.onPlanChange?.(this.plan);
+    } catch (err) {
+      console.error('[InterviewAgent] Plan synthesis failed:', err);
+      this.plan = {
+        candidateName: this.candidateName || 'there',
+        role: this.role,
+        greeting: `Hi, welcome to your ${this.role} interview. Let's get started.`,
+        todos: (this.session?.topics_planned || []).map((t, i) => ({
+          id: `t${i}`, area: t.topic || t, intent: '', status: 'pending', priority: 'medium', attempts: 0,
+        })),
+        closing: 'Thank you for your time today. We will be in touch.',
+        resumeContext: '',
+      };
+      this.onPlanChange?.(this.plan);
+    }
+
+    const firstQText = this.currentQuestion?.question_text || this.currentQuestion?.question;
+    if (firstQText) {
+      await this._addToHistory('interviewer', firstQText);
+      this.machine.transition(S.SPEAKING, 'Asking first question...');
+      await this._safeSpeak(firstQText);
+    } else {
+      await this._addToHistory('interviewer', this.plan.greeting);
+      this.machine.transition(S.SPEAKING, 'Greeting candidate...');
+      await this._safeSpeak(this.plan.greeting);
+    }
+
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  /** Handle a completed user utterance (from VAD or manual submit). */
+  async handleUserInput(text) {
+    const trimmed = text?.trim();
+    if (!trimmed) return;
+    if (this.isSubmitting) return;
+
+    // Immediately stop any TTS audio playing right now
+    stopAudio();
+
+    // Pure server-driven turn processing: AI Turn Director determines stay, advance, or conclude
+    await this._processUserAnswer(trimmed);
+  }
+
+  /** Manual mic toggle from UI button. Mic only listens when candidate explicitly activates it. */
+  async toggleMic() {
+    if (this.isListening) {
+      // User tapped mic while it was active: capture what was transcribed and submit
+      const captured = (this.listener.finalTranscript + ' ' + this.listener.interimTranscript).trim();
+      this._stopListening();
+      if (captured.length > 2) {
+        await this.handleUserInput(captured);
+      } else {
+        this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+      }
+    } else {
+      // User tapped Voice button: stop any TTS and activate mic
+      stopAudio();
+      this._stopListening();
+      await this._startListening();
+    }
+  }
+
+  /** Interrupt the speaking agent (user tapped orb or pressed key). */
+  async interrupt() {
+    stopAudio();
+    this._stopListening();
+    this.machine.transition(S.AWAITING_RESPONSE, 'Listening to your response...');
+    await this._startListening();
+  }
+
+  /** Manual pause/resume toggle. */
+  async togglePause() {
+    if (this.machine.state === S.PAUSED) {
+      await this._resumeFromPause();
+    } else {
+      stopAudio();
+      this._stopListening();
+      this.machine.transition(S.PAUSED, 'Interview paused');
+    }
+  }
+
+  /** Called by App when a new question arrives from backend. */
+  setCurrentQuestion(question) {
+    this.currentQuestion = question;
+  }
+
+  /** Force-end the interview immediately — used by UI button and "end interview" intent. */
+  async forceEnd() {
+    const st = this.machine.state;
+    if (st === S.COMPLETE || st === S.WRAPPING_UP) return;
+    stopAudio();
+    this._stopListening();
+    this.abortController?.abort();
+    this.isSubmitting = false;
+    await this._wrapUp();
+  }
+
+  /** Tear down cleanly — call on unmount. */
+  destroy() {
+    stopAudio();
+    this._stopListening();
+    this.machine.reset('Agent destroyed');
+    this.abortController?.abort();
+  }
+
+  // ── Internal ─────────────────────────────────────────────────────────────────
+
+  _wireListener() {
+    this.listener.onVolume = (vol) => this.onVolume?.(vol);
+    this.listener.onInterim = (text) => this.onLiveTranscript?.(text);
+    this.listener.onFinal = (text) => this.onLiveTranscript?.(text);
+
+    this.listener.onSilence = async (fullText) => {
+      if (
+        this.machine.state === S.AWAITING_RESPONSE ||
+        this.machine.state === S.CLARIFYING ||
+        this.machine.state === S.INTERRUPTED
+      ) {
+        await this.handleUserInput(fullText);
+      }
+    };
+
+    this.listener.onError = (err) => {
+      const code = err?.error || err?.message || String(err);
+      if (code === 'not-allowed') {
+        this.machine.transition(S.ERROR, 'Microphone permission denied.');
+        this.onError?.('Microphone access denied. You can still type your answers below.');
+      } else if (code === 'Web Speech API is not supported in this browser.' || code?.includes?.('not supported')) {
+        this.onError?.('Voice unavailable in this browser. Use text input below.');
+      } else if (code !== 'no-speech') {
+        console.warn('[InterviewAgent] Listener error:', code);
+        this._handleListenerRestart();
+      }
+    };
+
+    this.listener.onEnd = () => {
+      if (
+        this.machine.state === S.AWAITING_RESPONSE ||
+        this.machine.state === S.CLARIFYING ||
+        this.machine.state === S.INTERRUPTED
+      ) {
+        this._handleListenerRestart();
+      }
+    };
+  }
+
+  async _handleListenerRestart() {
+    this.listenerRestarts++;
+    if (this.listenerRestarts > MAX_LISTENER_RESTARTS) {
+      this.machine.transition(S.ERROR, 'Microphone unavailable after repeated failures.');
+      this.onError?.('Mic stopped responding. Switching to text input.');
+      this.listenerRestarts = 0;
+      return;
+    }
+    await new Promise(r => setTimeout(r, 400));
+    if (
+      this.machine.state === S.AWAITING_RESPONSE ||
+      this.machine.state === S.CLARIFYING ||
+      this.machine.state === S.INTERRUPTED
+    ) {
+      try {
+        await this.listener.start();
+      } catch (_) {}
+    }
+  }
+
+  async _finishSpeaking() {
+    // Safety delay to ensure TTS audio has finished rendering
+    await new Promise(r => setTimeout(r, POST_TTS_GUARD_MS));
+    if (this.machine.state === S.SPEAKING || this.machine.state === S.CLARIFYING || this.machine.state === S.RECOVERING) {
+      this._stopListening();
+      this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+    }
+  }
+
+  async _startListening() {
+    this.listenerRestarts = 0;
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+    this.machine.transition(S.AWAITING_RESPONSE, 'Listening to your response...');
+    try {
+      await this.listener.start();
+    } catch (err) {
+      const isPermission = err?.message?.includes('Permission') || err?.name === 'NotAllowedError';
+      if (isPermission) {
+        this.machine.transition(S.ERROR, 'Microphone permission denied.');
+        this.onError?.('Microphone access denied. You can still type your answers below.');
+      } else {
+        this.onError?.('Voice unavailable. Text input is active.');
+      }
+    }
+  }
+
+  _stopListening() {
+    try { this.listener.stop(); } catch (_) {}
+    this.onVolume?.(0);
+  }
+
+  async _handleInterruption(text) {
+    stopAudio();
+    this._stopListening();
+    this.machine.transition(S.INTERRUPTED, 'Interrupted. Listening...');
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+
+    if (text) {
+      await this._processUserAnswer(text);
+    } else {
+      await this._startListening();
+    }
+  }
+
+  async _resumeFromPause() {
+    this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+    this._stopListening();
+  }
+
+  /** Core: take user's answer, evaluate, advance plan. */
+  async _processUserAnswer(text) {
+    this._stopListening();
+    this.onLiveTranscript?.('');
+    await this._addToHistory('candidate', text);
+
+    const transitioned = this.machine.transition(S.PROCESSING, 'Evaluating your response...');
+    if (!transitioned) {
+      console.warn('[InterviewAgent] _processUserAnswer called from invalid state:', this.machine.state);
+      this.isSubmitting = false;
+      return;
+    }
+
+    this.abortController?.abort();
+    const ac = new AbortController();
+    this.abortController = ac;
+
+    try {
+      const result = await this._onSubmitAnswer(
+        this.currentQuestion?.id,
+        text,
+        ac.signal
+      );
+
+      if (ac.signal.aborted) return;
+
+      if (result?.action === 'stay') {
+        const reply = result.interviewer_reply || "Whenever you're ready, let me know your thoughts on this topic.";
+        await this._addToHistory('interviewer', reply);
+        this.machine.transition(S.SPEAKING, 'Interviewer replying...');
+        await this._safeSpeak(reply);
+        if (this.machine.state === S.SPEAKING) {
+          await this._finishSpeaking();
+        }
+        return;
+      }
+
+      if (result?.action === 'conclude' || result?.is_session_completed) {
+        await this._wrapUp();
+        return;
+      }
+
+      this._syncTopicCoverage(result?.progress?.topic_coverage, this.currentQuestion?.topic);
+
+      if (result?.next_question) {
+        this.currentQuestion = result.next_question;
+        await this._speakNextQuestion(result);
+      } else {
+        await this._safeRecover('Got an unexpected response from the server. Let me continue.');
+      }
+    } catch (err) {
+      if (ac.signal.aborted) return;
+      console.error('[InterviewAgent] Submit answer failed:', err);
+      this.machine.transition(S.RECOVERING, 'Network error. Retrying...');
+      await this._safeSpeak('I had a connection issue. Let me repeat the question.');
+      await this._speakQuestion(this.currentQuestion);
+    } finally {
+      this.isSubmitting = false;
+    }
+  }
+
+  async _speakNextQuestion(result) {
+    const nextQ = result.next_question;
+    const questionText = nextQ.question_text || nextQ.question || '';
+
+    await this._addToHistory('interviewer', questionText);
+    this.machine.transition(S.SPEAKING, 'Asking next question...');
+    await this._safeSpeak(questionText);
+
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _speakQuestion(question) {
+    if (!question) return;
+    const text = question.question_text || question.question || '';
+    await this._addToHistory('interviewer', text);
+    this.machine.transition(S.SPEAKING, 'Asking question...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _wrapUp() {
+    this.machine.transition(S.WRAPPING_UP, 'Wrapping up interview...');
+    const closingText = this.plan?.closing || `Thank you so much for your time today, ${this.candidateName || 'there'}. That wraps up our screening. We are synthesizing your detailed evaluation report.`;
+    await this._addToHistory('interviewer', closingText);
+    await this._safeSpeak(closingText);
+    this.machine.transition(S.COMPLETE, 'Interview complete');
+    setTimeout(() => {
+      this._onComplete?.();
+    }, 800);
+  }
+
+  async _safeSpeak(text) {
+    try {
+      await speakText(text);
+    } catch (err) {
+      console.warn('[InterviewAgent] TTS failed:', err);
+    }
+  }
+
+  async _speakAndTransition(text, toState, message) {
+    this.machine.transition(S.SPEAKING, 'Speaking...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      this.machine.transition(toState, message);
+    }
+  }
+
+  async _safeRecover(message) {
+    this.machine.transition(S.RECOVERING, message);
+    await this._safeSpeak(message);
+    await this._finishSpeaking();
+  }
+
+  async _addToHistory(role, text) {
+    const entry = { role, text, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
+    this.conversationHistory.push(entry);
+    this.onHistoryChange?.([...this.conversationHistory]);
+  }
+
+  _syncTopicCoverage(topicCoverage, fallbackTopic) {
+    if (!this.plan || !this.plan.todos) return;
+
+    if (topicCoverage && Object.keys(topicCoverage).length > 0) {
+      for (const todo of this.plan.todos) {
+        const areaNorm = todo.area.toLowerCase().trim();
+        const matchedKey = Object.keys(topicCoverage).find(
+          k => k.toLowerCase().trim() === areaNorm ||
+               k.toLowerCase().trim().includes(areaNorm) ||
+               areaNorm.includes(k.toLowerCase().trim())
+        );
+        if (matchedKey) {
+          const entry = topicCoverage[matchedKey];
+          if (entry.covered) {
+            todo.status = 'covered';
+          } else if (entry.attempts >= 2) {
+            todo.status = 'reviewed';
+          } else if (entry.attempts > 0) {
+            todo.status = 'probing';
+          }
+          todo.attempts = entry.attempts || 0;
+        }
+      }
+      this.onPlanChange?.({ ...this.plan, todos: [...this.plan.todos] });
+      return;
+    }
+
+    this._markTodoCovered(fallbackTopic);
+  }
+
+  _markTodoCovered(topic) {
+    if (!this.plan || !this.plan.todos) return;
+    const cleanTopic = String(topic || '').toLowerCase().trim();
+    
+    // First, attempt to match the pending todo by topic name
+    let todo = this.plan.todos.find(
+      t => t.status === 'pending' && cleanTopic && (
+        cleanTopic.includes(t.area.toLowerCase().trim()) ||
+        t.area.toLowerCase().trim().includes(cleanTopic)
+      )
+    );
+
+    // Fallback: match the first pending todo
+    if (!todo) {
+      todo = this.plan.todos.find(t => t.status === 'pending');
+    }
+
+    if (todo) {
+      todo.status = 'covered';
+      todo.attempts = (todo.attempts || 0) + 1;
+      this.onPlanChange?.({ ...this.plan, todos: [...this.plan.todos] });
+    }
+  }
+}
+
+export default InterviewAgent;
+
+
+
+
+# FILE NOT FOUND: frontend/src/hooks/useInterviewAgent.js
+
+================================================================================
+FILE 05/12: frontend/src/components/InterviewAgentScreen.jsx
+DESCRIPTION: Frontend Voice Interview Room UI Component
+================================================================================
+
+// frontend/src/components/InterviewAgentScreen.jsx
+// Clean chat + voice interview interface styled consistently with the landing page
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Mic, Volume2, Pause,
+  Check, Circle, Loader2,
+  ListTodo, X, Send, LogOut
+} from 'lucide-react';
+import { useInterviewAgent } from '../voice/useInterviewAgent';
+import { S } from '../voice/interviewAgent';
+
+function InterviewAgentScreen({
+  session,
+  candidateName,
+  selectedRole,
+  resumeText,
+  currentQuestion,
+  onSubmitAnswer,
+  onComplete,
+}) {
+  const [inputText, setInputText] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const [isPlanOpen, setIsPlanOpen] = useState(false);
+  const chatBottomRef = useRef(null);
+  const inputRef = useRef(null);
+
+  const agent = useInterviewAgent({
+    session,
+    candidateName,
+    role: selectedRole,
+    resumeText,
+    currentQuestion,
+    onSubmitAnswer,
+    onComplete,
+  });
+
+  // Auto-scroll chat on new messages or live transcripts
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [agent.history, agent.liveTranscript]);
+
+  // Auto-start interview on mount
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!agent.hasStarted) {
+        agent.start();
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const handleOrbClick = async () => {
+    if (!agent.hasStarted) {
+      await agent.start();
+      return;
+    }
+    if (agent.isSpeaking) {
+      await agent.interrupt();
+    } else {
+      await agent.toggleMic();
+    }
+  };
+
+  const handleTextSubmit = async (e) => {
+    e?.preventDefault();
+    const text = inputText.trim() || agent.liveTranscript.trim();
+    if (!text) return;
+    setInputText('');
+    await agent.submitText(text);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleTextSubmit();
+    }
+  };
+
+  const coveredTodos = agent.plan?.todos.filter(t => t.status === 'covered' || t.status === 'reviewed') || [];
+  const totalTodos = agent.plan?.todos.length || 0;
+  const isBusy = agent.isProcessing || agent.isPlanning;
+  const canSend = !isBusy && !agent.isComplete && (inputText.trim() || agent.liveTranscript.trim());
+
+  return (
+    <div style={{
+      maxWidth: '680px',
+      width: '100%',
+      margin: '0 auto',
+      height: '100vh',
+      display: 'flex',
+      flexDirection: 'column',
+      position: 'relative',
+      padding: '24px 16px 20px',
+      boxSizing: 'border-box'
+    }}>
+
+      {/* ── Top Center Aptus Wordmark ── */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '0 0 16px',
+        flexShrink: 0,
+        position: 'relative'
+      }}>
+        <h1 className="text-wordmark" style={{ fontSize: '28px', margin: 0, lineHeight: '1.0', letterSpacing: '-0.02em' }}>
+          Aptus
+        </h1>
+
+        {/* Header Action Buttons (top right) */}
+        <div style={{ position: 'absolute', right: 0, top: '2px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {totalTodos > 0 && (
+            <button
+              type="button"
+              onClick={() => setIsPlanOpen(!isPlanOpen)}
+              className="btn-liquid-glass"
+              style={{
+                padding: '6px 12px',
+                fontSize: '12px',
+                borderRadius: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}
+            >
+              <ListTodo size={13} />
+              <span>Plan ({coveredTodos.length}/{totalTodos})</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => agent.forceEnd()}
+            disabled={agent.isComplete || agent.state === S.WRAPPING_UP}
+            className="btn-liquid-glass"
+            style={{
+              padding: '6px 12px',
+              fontSize: '12px',
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              color: 'var(--color-text-secondary)',
+              cursor: 'pointer'
+            }}
+            title="End interview and view evaluation summary"
+          >
+            <LogOut size={13} />
+            <span>End</span>
+          </button>
+        </div>
+        {/* Toast: voice-unavailable / error info */}
+        {agent.errorMessage && (
+          <div style={{
+            position: 'absolute',
+            bottom: '-2px',
+            left: 0,
+            right: 0,
+            display: 'flex',
+            justifyContent: 'center'
+          }}>
+            <span style={{
+              fontSize: '11px',
+              color: 'var(--color-text-secondary)',
+              background: 'rgba(243,240,233,0.9)',
+              borderRadius: '6px',
+              padding: '3px 10px',
+              border: '1px solid var(--color-border)'
+            }}>
+              {agent.errorMessage}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* ── Slide-down Interview Plan Overlay ── */}
+      {isPlanOpen && (
+        <div style={{
+          position: 'absolute',
+          top: '56px',
+          left: '16px',
+          right: '16px',
+          backgroundColor: 'rgba(253, 252, 248, 0.96)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          border: '1px solid var(--color-border)',
+          borderRadius: '16px',
+          padding: '20px',
+          boxShadow: '0 16px 36px rgba(16, 16, 16, 0.12)',
+          zIndex: 50,
+          maxHeight: '70vh',
+          overflowY: 'auto'
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+            <span style={{ fontSize: '13px', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Planned Assessment Topics
+            </span>
+            <button
+              onClick={() => setIsPlanOpen(false)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '4px', color: 'var(--color-text-secondary)' }}
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {agent.plan?.todos?.map((todo) => {
+              const isCovered = todo.status === 'covered';
+              const isProbing = todo.status === 'probing';
+              const isReviewed = todo.status === 'reviewed';
+
+              return (
+                <div
+                  key={todo.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    padding: '10px 12px',
+                    borderRadius: '10px',
+                    backgroundColor: isCovered
+                      ? 'rgba(22, 163, 74, 0.05)'
+                      : isProbing
+                      ? 'rgba(217, 119, 6, 0.06)'
+                      : 'var(--color-base)',
+                    border: isProbing
+                      ? '1px solid rgba(217, 119, 6, 0.3)'
+                      : '1px solid var(--color-border)'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                    <div style={{ marginTop: '2px' }}>
+                      {isCovered ? (
+                        <Check size={14} color="#16a34a" strokeWidth={2.5} />
+                      ) : isProbing ? (
+                        <Circle size={14} color="#d97706" strokeWidth={2.5} />
+                      ) : isReviewed ? (
+                        <Check size={14} color="var(--color-text-muted)" strokeWidth={2} />
+                      ) : (
+                        <Circle size={14} color="var(--color-text-muted)" strokeWidth={1.5} />
+                      )}
+                    </div>
+                    <div>
+                      <div style={{
+                        fontSize: '13px',
+                        fontWeight: '500',
+                        color: isCovered
+                          ? '#15803d'
+                          : isProbing
+                          ? '#b45309'
+                          : isReviewed
+                          ? 'var(--color-text-muted)'
+                          : 'var(--color-text)'
+                      }}>
+                        {todo.area}
+                      </div>
+                      {todo.intent && (
+                        <p style={{ fontSize: '11.5px', color: 'var(--color-text-secondary)', margin: '2px 0 0', lineHeight: 1.4 }}>
+                          {todo.intent}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <span style={{
+                    fontSize: '10.5px',
+                    fontWeight: '600',
+                    padding: '2px 8px',
+                    borderRadius: '6px',
+                    flexShrink: 0,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.04em',
+                    backgroundColor: isCovered
+                      ? 'rgba(22, 163, 74, 0.12)'
+                      : isProbing
+                      ? 'rgba(217, 119, 6, 0.15)'
+                      : isReviewed
+                      ? 'rgba(100, 116, 139, 0.1)'
+                      : 'rgba(0, 0, 0, 0.04)',
+                    color: isCovered
+                      ? '#15803d'
+                      : isProbing
+                      ? '#b45309'
+                      : isReviewed
+                      ? 'var(--color-text-muted)'
+                      : 'var(--color-text-secondary)'
+                  }}>
+                    {isCovered ? 'Mastered' : isProbing ? 'Probing (2nd Attempt)' : isReviewed ? 'Evaluated' : 'Upcoming'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Main Chat Log ── */}
+      <div style={{
+        flex: 1,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        padding: '12px 4px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        gap: '16px'
+      }}>
+        {/* Welcome message when starting */}
+        {agent.history.length === 0 && (
+          <div style={{
+            alignSelf: 'flex-start',
+            maxWidth: '85%',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px'
+          }}>
+            <div style={{
+              padding: '14px 18px',
+              borderRadius: '20px 20px 20px 4px',
+              backgroundColor: 'rgba(255, 255, 255, 0.7)',
+              backdropFilter: 'blur(16px)',
+              WebkitBackdropFilter: 'blur(16px)',
+              border: '1px solid rgba(255, 255, 255, 0.95)',
+              boxShadow: '0 8px 24px -4px rgba(16, 16, 16, 0.08), inset 0 1px 1px 0 rgba(255, 255, 255, 1)',
+              lineHeight: 1.6,
+              fontSize: '14.5px',
+              color: 'var(--color-text)'
+            }}>
+              Hi {candidateName || 'there'}! Type your answer below, or click Voice when you'd like to speak.
+            </div>
+          </div>
+        )}
+
+        {/* History Dialogue Bubbles */}
+        {agent.history.map((turn, idx) => {
+          const isInterviewer = turn.role === 'interviewer';
+          return (
+            <div
+              key={idx}
+              style={{
+                alignSelf: isInterviewer ? 'flex-start' : 'flex-end',
+                maxWidth: '85%',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px'
+              }}
+            >
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                paddingLeft: isInterviewer ? '4px' : 0,
+                paddingRight: isInterviewer ? 0 : '4px',
+                justifyContent: isInterviewer ? 'flex-start' : 'flex-end'
+              }}>
+                <span style={{ fontSize: '10.5px', color: 'var(--color-text-muted)' }}>
+                  {turn.timestamp}
+                </span>
+              </div>
+
+              <div style={{
+                padding: '14px 18px',
+                borderRadius: isInterviewer ? '20px 20px 20px 4px' : '20px 20px 4px 20px',
+                backgroundColor: isInterviewer
+                  ? 'rgba(255, 255, 255, 0.75)'
+                  : 'var(--color-ivory)',
+                backdropFilter: 'blur(16px)',
+                WebkitBackdropFilter: 'blur(16px)',
+                border: '1px solid rgba(255, 255, 255, 0.95)',
+                boxShadow: isInterviewer
+                  ? '0 8px 24px -4px rgba(16, 16, 16, 0.08), inset 0 1.5px 1px 0 rgba(255, 255, 255, 1)'
+                  : '0 8px 20px -4px rgba(16, 16, 16, 0.06), inset 0 1px 1px 0 rgba(255, 255, 255, 0.8)',
+                lineHeight: 1.6,
+                fontSize: isInterviewer ? '14.5px' : '14px',
+                color: 'var(--color-text)'
+              }}>
+                {turn.text}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Live Interim Transcript Bubble */}
+        {agent.liveTranscript && (
+          <div style={{
+            alignSelf: 'flex-end',
+            maxWidth: '85%',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px'
+          }}>
+            <div style={{
+              padding: '12px 16px',
+              borderRadius: '20px 20px 4px 20px',
+              backgroundColor: 'rgba(37, 99, 235, 0.04)',
+              border: '1.5px dashed rgba(37, 99, 235, 0.35)',
+              color: 'var(--color-text)',
+              fontSize: '14px',
+              fontStyle: 'italic',
+              lineHeight: 1.5
+            }}>
+              "{agent.liveTranscript}"
+            </div>
+          </div>
+        )}
+
+        <div ref={chatBottomRef} />
+      </div>
+
+      {/* ── Shared Status Indicator (Common place for evaluating/processing/loading) ── */}
+      {(isBusy || agent.state === S.WRAPPING_UP) && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '8px',
+          padding: '6px 0 2px',
+          color: 'var(--color-text-secondary)',
+          fontSize: '12.5px',
+          flexShrink: 0
+        }}>
+          <Loader2 size={14} className="spin-anim" />
+          <span>
+            {agent.state === S.WRAPPING_UP
+              ? 'Synthesizing evaluation report...'
+              : agent.snapshot?.message || 'Evaluating your response...'}
+          </span>
+        </div>
+      )}
+
+      {/* ── Input + Voice Row Styled Like the Landing Screen ── */}
+      <form
+        onSubmit={handleTextSubmit}
+        style={{
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          padding: '8px 0 4px',
+          flexShrink: 0
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="text"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          onKeyDown={handleKeyDown}
+          disabled={agent.isComplete || isBusy}
+          placeholder={
+            isBusy
+              ? "Evaluating response..."
+              : agent.isListening
+              ? "Listening... (speak or type response)"
+              : "Type your answer (or click Voice)..."
+          }
+          style={{
+            flex: 1,
+            background: 'transparent',
+            border: 'none',
+            borderLeft: isFocused
+              ? '1.5px solid var(--color-obsidian-100)'
+              : '1.5px solid var(--color-border)',
+            outline: 'none',
+            fontSize: '14px',
+            fontFamily: 'var(--font-sans)',
+            color: 'var(--color-text)',
+            padding: '8px 2px 8px 12px',
+            textAlign: 'left',
+            transition: 'border-color 150ms ease-out'
+          }}
+        />
+
+        {/* Voice Button Styled as Landing Page Button */}
+        <button
+          type="button"
+          onClick={handleOrbClick}
+          disabled={isBusy || agent.isComplete}
+          className="btn-liquid-glass"
+          style={{
+            padding: '8px 18px',
+            fontSize: '13.5px',
+            borderRadius: '10px',
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            color: agent.isListening ? '#2563eb' : 'var(--color-text)',
+            opacity: (isBusy || agent.isComplete) ? 0.6 : 1
+          }}
+        >
+          {agent.isSpeaking ? (
+            <Volume2 size={16} />
+          ) : agent.isListening ? (
+            <Mic size={16} color="#2563eb" />
+          ) : (
+            <Mic size={16} />
+          )}
+          <span>
+            {agent.isListening ? 'Listening...' : agent.isSpeaking ? 'Interrupt' : 'Voice'}
+          </span>
+        </button>
+
+        {/* Send Button Styled as Landing Page Button with paper plane SVG */}
+        <button
+          type="submit"
+          disabled={!canSend}
+          className="btn-liquid-glass"
+          style={{
+            padding: '8px 18px',
+            fontSize: '13.5px',
+            borderRadius: '10px',
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            opacity: canSend ? 1 : 0.4
+          }}
+        >
+          <Send size={13} />
+          <span>Send</span>
+        </button>
+      </form>
+
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        .spin-anim { animation: spin 1s linear infinite; }
+      `}</style>
+    </div>
+  );
+}
+
+export default InterviewAgentScreen;
+
+
+
+# FILE NOT FOUND: frontend/src/components/VoiceOrb.jsx
+
+================================================================================
+FILE 07/12: frontend/src/api.js
+DESCRIPTION: Frontend HTTP Client for TTS, STT & Interview Flow
+================================================================================
+
+/**
+ * Aptus Frontend API Client
+ * Type-annotated async HTTP client communicating with FastAPI backend endpoints.
+ */
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
+/**
+ * Helper to unwrap JSON error messages from FastAPI responses.
+ * @param {Response} res
+ * @param {string} fallbackMsg
+ * @returns {Promise<Error>}
+ */
+async function createApiError(res, fallbackMsg) {
+  const errorData = await res.json().catch(() => ({}));
+  const message = errorData.detail || errorData.message || fallbackMsg;
+  const err = new Error(message);
+  err.status = res.status;
+  return err;
+}
+
+/**
+ * Checks system health and supported roles.
+ * @returns {Promise<{ status: string, timestamp: string, gemini_model: string, roles: string[] }>}
+ */
+export async function checkHealth() {
+  const res = await fetch(`${API_BASE_URL}/health`);
+  if (!res.ok) throw await createApiError(res, 'Health check failed');
+  return res.json();
+}
+
+/**
+ * Fetches list of available screening domain tracks.
+ * @returns {Promise<{ roles: string[], description: string }>}
+ */
+export async function fetchRoles() {
+  const res = await fetch(`${API_BASE_URL}/roles`);
+  if (!res.ok) throw await createApiError(res, 'Failed to fetch roles');
+  return res.json();
+}
+
+/**
+ * Initializes a new interview screening session.
+ * @param {Object} params
+ * @param {string} params.name - Candidate name (letters only)
+ * @param {string} params.role - Target role title
+ * @param {string|null} [params.resumeText] - Raw pasted resume text
+ * @param {File|null} [params.resumeFile] - Uploaded PDF resume file
+ * @returns {Promise<Object>} StartInterviewResponse
+ */
+export async function startInterview({ name, role, resumeText, resumeFile }) {
+  const formData = new FormData();
+  formData.append('name', name || 'Candidate');
+  formData.append('role', role);
+  if (resumeText) {
+    formData.append('resume_text', resumeText);
+  }
+  if (resumeFile) {
+    formData.append('resume_file', resumeFile);
+  }
+
+  const res = await fetch(`${API_BASE_URL}/sessions/start`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to start interview session');
+  }
+
+  return res.json();
+}
+
+/**
+ * Retrieves the next question or completion status for an active session.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} NextQuestionResponse
+ */
+export async function getNextQuestion(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/next-question`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch next question');
+  }
+  return res.json();
+}
+
+/**
+ * Submits a candidate answer for real-time evaluation and next-question generation.
+ * @param {string} sessionId
+ * @param {string} questionId
+ * @param {string} answerText
+ * @param {AbortSignal} [signal] - Optional abort signal
+ * @returns {Promise<Object>} SubmitAnswerResponse
+ */
+export async function submitAnswer(sessionId, questionId, answerText, signal) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/answer`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      question_id: questionId,
+      answer_text: answerText,
+    }),
+    signal,
+  });
+
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to submit answer');
+  }
+
+  return res.json();
+}
+
+/**
+ * Explicitly terminates an interview session and triggers executive evaluation synthesis.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionSummaryResponse
+ */
+export async function endSession(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/end`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to end session');
+  }
+  return res.json();
+}
+
+/**
+ * Fetches the executive evaluation report for a completed session.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionSummaryResponse
+ */
+export async function getSessionSummary(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/summary`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch summary');
+  }
+  return res.json();
+}
+
+/**
+ * Synthesizes natural speech using Google Cloud TTS.
+ * @param {string} text - Text to synthesize
+ * @param {string} [languageCode='en-US'] - Language code
+ * @returns {Promise<Blob>} Audio blob (MP3)
+ */
+export async function synthesizeSpeech(text, languageCode = 'en-US') {
+  const res = await fetch(`${API_BASE_URL}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, language_code: languageCode }),
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'TTS synthesis failed');
+  }
+  return res.blob();
+}
+
+/**
+ * Transcribes audio recording using backend Groq Whisper STT API.
+ * @param {Blob} audioBlob - Recorded audio blob
+ * @param {string} [language='en'] - Language code
+ * @returns {Promise<{ text: string, confidence: number, segments: Array }>}
+ */
+export async function transcribeAudio(audioBlob, language = 'en') {
+  const formData = new FormData();
+  formData.append('audio', audioBlob, 'recording.webm');
+  formData.append('language', language);
+
+  const res = await fetch(`${API_BASE_URL}/stt`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'STT transcription failed');
+  }
+  return res.json();
+}
+
+/**
+ * Fetches full Q&A transcript with judge verdicts and literature chunk traceability.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionHistoryResponse
+ */
+export async function getSessionHistory(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/history`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch history');
+  }
+  return res.json();
+}
+
+
+
+
+
+================================================================================
+FILE 08/12: backend/app/core/gemini.py
+DESCRIPTION: Backend AI Engine (Groq Whisper STT, Google Cloud TTS, Gemini 2.5 Flash)
+================================================================================
+
+"""
+Gemini LLM Client & Structured Output Generator
+Interfaces with Google Generative AI with Pydantic validation and fallback factories.
+Also provides Groq STT adapter for voice transcription.
+"""
+
+import json
+import logging
+import re
+from typing import Type, TypeVar, Optional, Any, Callable, List
+from pydantic import BaseModel
+from backend.app.config import settings
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound=BaseModel)
+
+# Lazy client singleton
+_model_instance = None
+
+
+def get_gemini_model():
+    """
+    Returns a configured GenerativeModel singleton instance.
+    Falls back gracefully if API key is invalid or unavailable.
+    """
+    global _model_instance
+    if _model_instance is not None:
+        return _model_instance
+
+    api_key = settings.GEMINI_API_KEY
+    if not api_key:
+        logger.warning("GEMINI_API_KEY is not set. Using local heuristic fallback for LLM generation.")
+        return None
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        
+        candidate_models = [
+            settings.GEMINI_MODEL,
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-flash"
+        ]
+        
+        for m_name in candidate_models:
+            try:
+                m = genai.GenerativeModel(
+                    model_name=m_name,
+                    generation_config={"temperature": 0.3}
+                )
+                _model_instance = m
+                logger.info(f"Initialized Gemini model: {m_name}")
+                return _model_instance
+            except Exception as me:
+                logger.warning(f"Failed to load model {m_name}: {me}")
+                continue
+                
+        return _model_instance
+    except Exception as e:
+        logger.error(f"Failed to initialize google.generativeai model: {e}")
+        return None
+
+
+def transcribe_audio_groq(
+    audio_bytes: bytes,
+    language: str = "en",
+    filename: Optional[str] = None
+) -> dict:
+    """
+    Transcribes audio using Groq's free STT API (whisper-large-v3-turbo).
+    Supports all media formats (webm, opus, ogg, wav, mp3, mp4, m4a).
+    
+    Args:
+        audio_bytes: Raw audio data
+        language: Language code for transcription
+        filename: Optional source filename with extension
+        
+    Returns:
+        dict with keys:
+            - text: transcribed text
+            - confidence: confidence score (0-1)
+            - segments: optional list of word-level segments with timestamps
+    """
+    import time
+    start_time = time.time()
+    logger.info(f"[STT][Groq Whisper] Received audio payload: {len(audio_bytes)} bytes | language={language}")
+
+    groq_api_key = settings.GROQ_API_KEY
+    if not groq_api_key:
+        logger.warning("[STT][Groq Whisper] GROQ_API_KEY is not set. STT will fail.")
+        return {"text": "", "confidence": 0.0, "error": "GROQ_API_KEY not configured"}
+    
+    # Auto-detect audio container format from magic bytes if not specified
+    if not filename or filename.endswith(".bin"):
+        if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+            filename = "recording.webm"
+        elif audio_bytes[:4] == b"OggS":
+            filename = "recording.ogg"
+        elif audio_bytes[:4] == b"RIFF":
+            filename = "recording.wav"
+        elif audio_bytes[:3] == b"ID3" or (len(audio_bytes) > 2 and audio_bytes[0] == 0xff and (audio_bytes[1] & 0xe0) == 0xe0):
+            filename = "recording.mp3"
+        elif len(audio_bytes) > 8 and audio_bytes[4:8] == b"ftyp":
+            filename = "recording.mp4"
+        else:
+            filename = "recording.webm"
+
+    try:
+        from groq import Groq
+        
+        client = Groq(api_key=groq_api_key)
+        
+        logger.info(f"[STT][Groq Whisper] Dispatching transcription to whisper-large-v3-turbo (format: {filename})...")
+        transcription = client.audio.transcriptions.create(
+            file=(filename, audio_bytes),
+            model="whisper-large-v3-turbo",
+            language=language,
+            response_format="verbose_json"
+        )
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        text = transcription.text.strip()
+        confidence = getattr(transcription, 'confidence', 1.0)
+        segments = getattr(transcription, 'segments', [])
+
+        result = {
+            "text": text,
+            "confidence": confidence,
+            "segments": segments
+        }
+        
+        logger.info(
+            f"[STT][Groq Whisper] SUCCESS in {elapsed_ms:.1f}ms | "
+            f"Confidence: {confidence:.2f} | Segments: {len(segments)} | Text: '{text[:120]}...'"
+        )
+        return result
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"[STT][Groq Whisper] FAILED after {elapsed_ms:.1f}ms: {e}")
+        return {"text": "", "confidence": 0.0, "error": str(e)}
+
+
+def synthesize_speech_google(text: str, language_code: str = "en-US") -> dict:
+    """
+    Synthesizes speech using Google Cloud TTS (free tier standard voice).
+    
+    Args:
+        text: Text to synthesize
+        language_code: BCP-47 language code
+        
+    Returns:
+        dict with keys:
+            - audio_content: base64-encoded audio bytes (MP3)
+            - audio_config: config used for synthesis
+    """
+    import time
+    start_time = time.time()
+    logger.info(f"[TTS][Google Cloud] Received synthesis request for {len(text)} chars | lang={language_code} | preview: '{text[:80]}...'")
+
+    google_creds = settings.GOOGLE_CLOUD_CREDENTIALS
+    if not google_creds:
+        logger.warning("[TTS][Google Cloud] GOOGLE_CLOUD_CREDENTIALS is not set. TTS will fail.")
+        return {"audio_content": b"", "error": "GOOGLE_CLOUD_CREDENTIALS not configured"}
+    
+    try:
+        from google.cloud import texttospeech
+        import json
+        
+        # Load credentials from JSON string
+        creds_info = json.loads(google_creds)
+        from google.oauth2 import service_account
+        credentials = service_account.Credentials.from_service_account_info(creds_info)
+        
+        client = texttospeech.TextToSpeechClient(credentials=credentials)
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        # Standard voice (free tier) - en-US-Standard-A
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=language_code,
+            name="en-US-Standard-A",  # Free tier standard voice
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        
+        # MP3 output (smaller, good for streaming)
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,
+            pitch=0.0
+        )
+        
+        logger.info("[TTS][Google Cloud] Calling synthesize_speech API with en-US-Standard-A...")
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        audio_bytes = response.audio_content
+        logger.info(
+            f"[TTS][Google Cloud] SUCCESS in {elapsed_ms:.1f}ms | Generated {len(audio_bytes)} bytes of MP3 audio"
+        )
+
+        result = {
+            "audio_content": audio_bytes,
+            "audio_config": {
+                "encoding": "MP3",
+                "sample_rate_hertz": 24000,
+                "voice": "en-US-Standard-A"
+            }
+        }
+        return result
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"[TTS][Google Cloud] FAILED after {elapsed_ms:.1f}ms: {e}")
+        return {"audio_content": b"", "error": str(e)}
+
+
+def _clean_json_markdown(raw_text: str) -> str:
+    """Strips markdown code blocks, backticks, and extra whitespace from raw LLM output."""
+    cleaned = raw_text.strip()
+    # Match ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+    elif cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned).rstrip("`").strip()
+    return cleaned
+
+
+def generate_structured(
+    prompt: Optional[str] = None,
+    response_schema: Optional[Type[T]] = None,
+    system_instruction: Optional[str] = None,
+    fallback_factory: Optional[Callable[[], T]] = None,
+    content_parts: Optional[List[Any]] = None
+) -> T:
+    """
+    Generates structured output validated against a Pydantic schema using Gemini.
+    Supports text prompts as well as multimodal content parts (e.g. PDF bytes).
+    Falls back to intelligent mock heuristics if Gemini is unavailable or errors.
+    """
+    if response_schema is None:
+        raise ValueError("response_schema must be provided for structured generation.")
+
+    model = get_gemini_model()
+
+    if model is not None:
+        try:
+            schema_json = json.dumps(response_schema.model_json_schema(), indent=2)
+            formatting_instructions = (
+                f"\n\nRespond ONLY with a valid JSON object strictly matching this JSON Schema:\n"
+                f"{schema_json}\n"
+                f"Do not include markdown code blocks, backticks, or any extraneous text. Just the raw JSON."
+            )
+
+            if content_parts:
+                full_content = []
+                if system_instruction:
+                    full_content.append(f"System Instruction:\n{system_instruction}")
+                full_content.extend(content_parts)
+                if prompt:
+                    full_content.append(f"User Request:\n{prompt}")
+                full_content.append(formatting_instructions)
+                response = model.generate_content(full_content)
+            else:
+                full_prompt = prompt or ""
+                if system_instruction:
+                    full_prompt = f"System Instruction:\n{system_instruction}\n\nUser Request:\n{prompt}"
+                formatting_prompt = f"{full_prompt}{formatting_instructions}"
+                response = model.generate_content(formatting_prompt)
+
+            raw_text = response.text or ""
+            cleaned_json_str = _clean_json_markdown(raw_text)
+            parsed_data = json.loads(cleaned_json_str)
+            return response_schema.model_validate(parsed_data)
+        except Exception as e:
+            logger.warning(f"Gemini structured generation failed: {e}. Attempting fallback.")
+
+    if fallback_factory is not None:
+        return fallback_factory()
+    
+    raise RuntimeError("LLM structured output generation failed and no fallback was provided.")
+
+
+
+================================================================================
+FILE 09/12: backend/app/adapters/modality.py
+DESCRIPTION: Backend Modality Adapters (VoiceAdapter & TextAdapter)
+================================================================================
+
+"""
+Voice and Text Adapters for Unified Turn Interface
+
+Both adapters produce identical Turn objects. The graph never knows which modality produced a turn.
+The only asymmetry is where physical interaction genuinely differs (recording/TTS vs typing/rendering).
+"""
+
+import logging
+import uuid
+from typing import Optional, Dict, Any
+from backend.app.graph.state import Turn
+from backend.app.core.gemini import transcribe_audio_groq, synthesize_speech_google
+
+logger = logging.getLogger(__name__)
+
+
+class TextAdapter:
+    """
+    Text modality adapter.
+    
+    Input: User types text and submits
+    Output: Turn object with normalized_text
+    
+    STATELESS: Pure function, no instance state.
+    """
+    
+    def submit_turn(self, text: str, session_id: str, current_state: Optional[Dict[str, Any]] = None) -> Turn:
+        """
+        Creates a Turn from typed text submission.
+        
+        Args:
+            text: The typed text from the candidate
+            session_id: Current session identifier
+            current_state: Current graph state (optional, for future extensibility)
+            
+        Returns:
+            Turn object with modality="text"
+        """
+        turn = Turn(
+            modality="text",
+            normalized_text=text.strip(),
+            asr_confidence=1.0,  # Text has perfect confidence
+            interruption_flag=False  # Text doesn't interrupt TTS
+        )
+        
+        logger.info(f"TextAdapter: Created turn {turn.turn_id} with {len(text)} chars")
+        return turn
+    
+    def render_response(self, text: str) -> Dict[str, Any]:
+        """
+        Renders agent response as text.
+        
+        Text rendering is near-instantaneous, so no interrupt mechanism needed.
+        This is deliberately atomic - unlike TTS, there's no meaningful duration to interrupt.
+        
+        Args:
+            text: Response text to render
+            
+        Returns:
+            Dict with rendered text
+        """
+        return {
+            "type": "text",
+            "content": text,
+            "rendered_at": True  # Instant render
+        }
+
+
+class VoiceAdapter:
+    """
+    Voice modality adapter.
+    
+    Implements push-to-talk interaction model:
+    - Button press → record → button release → STT → Turn
+    - Agent speaking + button press → stop TTS, start recording (manual interrupt)
+    
+    STATELESS DESIGN: All state is passed explicitly to avoid thread-safety issues
+    and enable proper concurrency. No instance variables for recording/speaking state.
+    
+    No VAD or endpointing logic needed - the button solves that.
+    """
+    
+    def start_recording(self, session_id: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Starts audio recording on button press.
+        
+        If agent is currently speaking (TTS playing), stops it immediately.
+        This is the manual interrupt path - no VAD needed.
+        
+        Args:
+            session_id: Current session identifier
+            current_state: Current graph state containing agent_speaking_flag
+            
+        Returns:
+            Updated state dict with is_recording=True and agent_speaking_flag=False if interrupted
+        """
+        was_speaking = current_state.get("agent_speaking_flag", False)
+        
+        if was_speaking:
+            logger.info(f"VoiceAdapter: Interrupting TTS for session {session_id}")
+            # Signal TTS cancellation (handled by frontend/player)
+        
+        # Return updated state instead of mutating instance variables
+        updated_state = current_state.copy()
+        updated_state["agent_speaking_flag"] = False
+        updated_state["_recording_active"] = True
+        updated_state["_audio_buffer"] = b""
+        
+        logger.info(f"VoiceAdapter: Started recording for session {session_id}")
+        return updated_state
+    
+    def append_audio(self, audio_chunk: bytes, current_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Appends audio data during recording.
+        
+        Args:
+            audio_chunk: Raw audio bytes (WAV format preferred)
+            current_state: Current graph state containing _audio_buffer
+            
+        Returns:
+            Updated state dict with appended audio data
+        """
+        if not current_state.get("_recording_active", False):
+            return current_state
+        
+        updated_state = current_state.copy()
+        current_buffer = updated_state.get("_audio_buffer", b"")
+        
+        if audio_chunk:
+            updated_state["_audio_buffer"] = current_buffer + audio_chunk
+        
+        return updated_state
+    
+    def stop_recording_and_transcribe(
+        self, 
+        session_id: str,
+        current_state: Dict[str, Any],
+        language: str = "en"
+    ) -> tuple[Optional[Turn], Dict[str, Any]]:
+        """
+        Stops recording and transcribes via Groq STT.
+        
+        STATELESS: Takes current_state as parameter, returns (Turn, updated_state)
+        
+        Args:
+            session_id: Current session identifier
+            current_state: Current graph state containing _recording_active and _audio_buffer
+            language: Language code for transcription
+            
+        Returns:
+            Tuple of (Turn object or None, updated state dict)
+        """
+        if not current_state.get("_recording_active", False):
+            logger.warning("VoiceAdapter: stop_recording called but not recording")
+            return None, current_state
+        
+        # Clear recording state
+        updated_state = current_state.copy()
+        updated_state["_recording_active"] = False
+        
+        audio_buffer = updated_state.get("_audio_buffer", b"")
+        
+        if not audio_buffer or len(audio_buffer) == 0:
+            logger.warning("VoiceAdapter: No audio data captured")
+            # Clear buffer
+            updated_state["_audio_buffer"] = None
+            return None, updated_state
+        
+        logger.info(f"[VoiceAdapter] Session {session_id} - Stop recording requested. Dispatching {len(audio_buffer)} bytes to Groq STT...")
+        # Transcribe via Groq
+        stt_result = transcribe_audio_groq(
+            audio_bytes=audio_buffer,
+            language=language
+        )
+        
+        # Clear buffer after capturing for STT call
+        updated_state["_audio_buffer"] = None
+        
+        if stt_result.get("error"):
+            logger.error(f"[VoiceAdapter] Session {session_id} - STT transcription failed: {stt_result['error']}")
+            # Still create a Turn but with empty text and low confidence
+            turn = Turn(
+                modality="voice",
+                normalized_text="",
+                asr_confidence=0.0,
+                interruption_flag=False
+            )
+        else:
+            turn = Turn(
+                modality="voice",
+                normalized_text=stt_result.get("text", ""),
+                asr_confidence=stt_result.get("confidence", 0.5),
+                interruption_flag=False  # Will be set by graph if arrived during agent_speaking
+            )
+            
+            logger.info(
+                f"[VoiceAdapter] Session {session_id} - Turn created: {len(turn.normalized_text)} chars "
+                f"(confidence: {turn.asr_confidence:.2f}) | Text: '{turn.normalized_text[:80]}...'"
+            )
+        
+        return turn, updated_state
+    
+    def speak_response(
+        self, 
+        text: str, 
+        language_code: str = "en-US",
+        current_state: Optional[Dict[str, Any]] = None
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Synthesizes speech via Google Cloud TTS (free tier standard voice).
+        
+        STATELESS: Takes current_state as parameter, returns (result, updated_state)
+        
+        Args:
+            text: Text to synthesize
+            language_code: BCP-47 language code
+            current_state: Current graph state (optional)
+            
+        Returns:
+            Tuple of (TTS result dict, updated state dict with agent_speaking_flag)
+        """
+        updated_state = current_state.copy() if current_state else {}
+        updated_state["agent_speaking_flag"] = True
+        
+        tts_result = synthesize_speech_google(
+            text=text,
+            language_code=language_code
+        )
+        
+        updated_state["agent_speaking_flag"] = False
+        
+        if tts_result.get("error"):
+            logger.error(f"VoiceAdapter: TTS failed - {tts_result['error']}")
+            error_result = {
+                "type": "audio",
+                "audio_content": b"",
+                "error": tts_result["error"],
+                "duration_ms": 0
+            }
+            return error_result, updated_state
+        
+        # Estimate duration from audio size (MP3 ~16KB/sec at typical quality)
+        audio_size = len(tts_result.get("audio_content", b""))
+        estimated_duration_ms = int((audio_size / 16000) * 1000)
+        
+        success_result = {
+            "type": "audio",
+            "audio_content": tts_result.get("audio_content", b""),
+            "encoding": "mp3",
+            "sample_rate_hertz": 24000,
+            "duration_ms": estimated_duration_ms
+        }
+        
+        return success_result, updated_state
+    
+    def cancel_speech(self, current_state: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+        """
+        Cancels ongoing TTS playback.
+        
+        Called when user presses push-to-talk button while agent is speaking.
+        
+        Args:
+            current_state: Current graph state containing agent_speaking_flag
+            
+        Returns:
+            Tuple of (was_speaking: bool, updated state dict)
+        """
+        was_speaking = current_state.get("agent_speaking_flag", False)
+        
+        updated_state = current_state.copy()
+        
+        if was_speaking:
+            updated_state["agent_speaking_flag"] = False
+            logger.info("VoiceAdapter: Speech cancelled by user interrupt")
+            return True, updated_state
+        
+        return False, updated_state
+
+
+def create_adapter(modality: str) -> TextAdapter | VoiceAdapter:
+    """
+    Factory function to create the appropriate adapter.
+    
+    Args:
+        modality: "text" or "voice"
+        
+    Returns:
+        Adapter instance for the specified modality
+    """
+    if modality == "voice":
+        return VoiceAdapter()
+    else:
+        return TextAdapter()
+
+
+
+================================================================================
+FILE 10/12: backend/app/api/routes.py
+DESCRIPTION: Backend FastAPI HTTP Routes (/api/tts, /api/stt, /api/sessions)
+================================================================================
+
+import re
+import logging
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+
+from backend.app.config import settings
+from backend.app.db.session import get_db
+from backend.app.db.models import Candidate, InterviewSession, Question, Answer, SessionSummary, get_utc_now
+from backend.app.schemas.interview import (
+    StartInterviewRequest,
+    StartInterviewResponse,
+    NextQuestionResponse,
+    QuestionItemResponse,
+    SubmitAnswerRequest,
+    SubmitAnswerResponse,
+    SessionSummaryResponse,
+    SessionHistoryResponse,
+    HistoryQAItem,
+    ResumeProfile,
+    PlannedTopic,
+    JudgeVerdict
+)
+from backend.app.core.resume_parser import (
+    extract_text_from_pdf_bytes,
+    validate_and_parse_resume,
+    parse_resume_to_profile
+)
+from backend.app.graph.workflow import step_start_interview, step_process_answer
+from backend.app.graph.state import InterviewState
+
+import io
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+from backend.app.core.gemini import synthesize_speech_google, transcribe_audio_groq
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+NAME_REGEX = r"^[A-Za-z]+$"
+
+
+class TTSRequest(BaseModel):
+    text: str
+    language_code: str = "en-US"
+
+
+@router.post("/tts", tags=["Voice & Audio"])
+async def text_to_speech(payload: TTSRequest):
+    """
+    Synthesizes speech using Google Cloud Text-to-Speech (free tier standard voice).
+    Returns MP3 audio stream for instant natural playback.
+    """
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    
+    result = synthesize_speech_google(payload.text, language_code=payload.language_code)
+    if result.get("error") or not result.get("audio_content"):
+        logger.warning(f"[TTS Route] Google Cloud TTS returned error: {result.get('error')}")
+        raise HTTPException(status_code=500, detail=result.get("error", "Speech synthesis failed."))
+    
+    return Response(
+        content=result["audio_content"],
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": "inline; filename=speech.mp3"}
+    )
+
+
+@router.post("/stt", tags=["Voice & Audio"])
+async def speech_to_text(
+    audio: UploadFile = File(...),
+    language: str = Form("en")
+):
+    """
+    Transcribes audio bytes using Groq Whisper API (whisper-large-v3-turbo).
+    Works with all browser MediaRecorder formats (webm, wav, ogg, mp3, mp4).
+    """
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio payload received.")
+    
+    orig_filename = audio.filename or "recording.webm"
+    result = transcribe_audio_groq(audio_bytes, language=language, filename=orig_filename)
+    if result.get("error") and not result.get("text"):
+        logger.warning(f"[STT Route] Groq STT returned error: {result.get('error')}")
+        raise HTTPException(status_code=500, detail=result.get("error", "Transcription failed."))
+    
+    return {
+        "text": result.get("text", ""),
+        "confidence": result.get("confidence", 1.0),
+        "segments": result.get("segments", [])
+    }
+
+
+@router.get("/health", tags=["System"])
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "gemini_model": settings.GEMINI_MODEL,
+        "roles": settings.ROLES
+    }
+
+
+
+@router.get("/roles", tags=["Configuration"])
+async def list_roles():
+    return {
+        "roles": settings.ROLES,
+        "description": "Supported interview screening domains"
+    }
+
+
+@router.post("/sessions/start", response_model=StartInterviewResponse, tags=["Interview Flow"])
+async def start_interview(
+    name: str = Form("Candidate"),
+    role: str = Form(...),
+    resume_text: Optional[str] = Form(None),
+    resume_file: Optional[UploadFile] = File(None),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Candidate entry point: Validates name format, uploads resume (PDF or text) and initiates interview session.
+    Parses resume, plans topics via LangGraph, and generates the first question.
+    """
+    clean_name = (name or "Candidate").strip()
+    logger.info("=" * 60)
+    logger.info(f"[Start Session] Processing Begin Session request for candidate='{clean_name}', role='{role}'")
+
+    # 1. Candidate Name Regex Validation (letters only, no numbers, no spaces)
+    if not re.match(NAME_REGEX, clean_name):
+        logger.warning(f"[Start Session] Name validation failed: '{clean_name}' contains numbers, spaces, or invalid characters.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Candidate name must contain only letters (no numbers or spaces)."
+        )
+
+    if role not in settings.ROLES:
+        logger.warning(f"[Start Session] Invalid role selected: '{role}'. Valid roles: {settings.ROLES}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid role '{role}'. Must be one of: {', '.join(settings.ROLES)}"
+        )
+
+    # 2. Extract resume text and optional raw PDF bytes
+    raw_resume_text = ""
+    pdf_bytes = None
+    if resume_file and resume_file.filename:
+        logger.info(f"[Start Session] Reading uploaded file: '{resume_file.filename}' (content_type: {resume_file.content_type})")
+        file_bytes = await resume_file.read()
+        if resume_file.filename.lower().endswith(".pdf"):
+            pdf_bytes = file_bytes
+            raw_resume_text = extract_text_from_pdf_bytes(file_bytes)
+            logger.info(f"[Start Session] Extracted {len(raw_resume_text)} characters of text from PDF bytes via pypdf.")
+        else:
+            raw_resume_text = file_bytes.decode("utf-8", errors="ignore")
+            logger.info(f"[Start Session] Decoded {len(raw_resume_text)} characters of text from uploaded file.")
+    elif resume_text:
+        raw_resume_text = resume_text.strip()
+        logger.info(f"[Start Session] Received pasted resume text ({len(raw_resume_text)} characters).")
+    else:
+        raw_resume_text = f"Candidate interested in {role} position."
+        logger.info("[Start Session] No resume text/file supplied; using default role placeholder.")
+
+    # 3. Strict Security & Authenticity Validation with Gemini
+    logger.info(f"[Start Session] Running sandboxed resume validation and credential extraction...")
+    validation = validate_and_parse_resume(
+        raw_text=raw_resume_text,
+        default_name=clean_name,
+        pdf_bytes=pdf_bytes,
+        target_role=role
+    )
+
+    if not validation.is_valid:
+        logger.warning(
+            f"[Start Session] Resume REJECTED for '{clean_name}': {validation.rejection_reason}, "
+            f"security_flags={validation.security_flags}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Resume rejected: {validation.rejection_reason or 'Document is invalid, non-resume content, or contains prompt injection.'}"
+        )
+
+    logger.info(
+        f"[Start Session] Resume APPROVED: is_valid=True, is_role_relevant={validation.is_role_relevant}, "
+        f"seniority='{validation.estimated_experience_level}', detected_skills={len(validation.skills)}, "
+        f"detected_technologies={len(validation.technologies)}"
+    )
+
+    validated_profile = validation.model_dump()
+    candidate_name = clean_name  # Preserve user's verified name input
+
+    # 4. Create Candidate in DB
+    candidate = Candidate(
+        name=candidate_name,
+        resume_raw_text=raw_resume_text,
+        role_selected=role,
+        resume_profile=validated_profile
+    )
+    db.add(candidate)
+    await db.flush()
+    logger.info(f"[Start Session] Candidate persisted in DB with ID={candidate.id}")
+
+    # 5. Create Session in DB
+    session = InterviewSession(
+        candidate_id=candidate.id,
+        role=role,
+        status="in_progress",
+        topics_planned=[]
+    )
+    db.add(session)
+    await db.flush()
+    logger.info(f"[Start Session] Interview session created with ID={session.id}")
+
+    # 6. Run LangGraph Start Flow
+    logger.info(f"[Start Session] Executing LangGraph start flow (planning topics & generating initial question)...")
+    graph_state = step_start_interview(
+        session_id=session.id,
+        candidate_id=candidate.id,
+        candidate_name=candidate_name,
+        role=role,
+        resume_raw_text=raw_resume_text,
+        resume_profile=validated_profile
+    )
+
+    # Update Candidate & Session with generated plan & profile
+    candidate.resume_profile = graph_state.get("resume_profile", validated_profile)
+    session.topics_planned = graph_state.get("topics_planned", [])
+    
+    # 7. Persist First Question
+    q_data = graph_state.get("current_question", {})
+    if q_data:
+        question = Question(
+            session_id=session.id,
+            question_text=q_data.get("question_text") or q_data.get("question", ""),
+            topic=q_data.get("topic", "Fundamentals"),
+            difficulty=q_data.get("difficulty", "mid"),
+            source_chunk_ids=q_data.get("source_chunks_detail", []),
+            order_index=0
+        )
+        db.add(question)
+        logger.info(f"[Start Session] Generated question on topic '{question.topic}' (difficulty: {question.difficulty})")
+
+    await db.commit()
+    await db.refresh(session)
+    await db.refresh(candidate)
+
+    logger.info(f"[Start Session] Session {session.id} successfully initialized with {len(session.topics_planned)} planned topics.")
+    logger.info("=" * 60)
+
+    return StartInterviewResponse(
+        session_id=session.id,
+        candidate_id=candidate.id,
+        candidate_name=candidate.name,
+        role=session.role,
+        status=session.status,
+        resume_profile=ResumeProfile(**candidate.resume_profile),
+        topics_planned=[PlannedTopic(**t) for t in session.topics_planned]
+    )
+
+
+@router.get("/sessions/{session_id}/next-question", response_model=NextQuestionResponse, tags=["Interview Flow"])
+async def get_next_question(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Returns the currently active unanswered question for the session.
+    """
+    # Fetch session
+    q_session = await db.execute(
+        select(InterviewSession)
+        .options(selectinload(InterviewSession.questions).selectinload(Question.answer))
+        .where(InterviewSession.id == session_id)
+    )
+    session = q_session.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    if session.status == "completed":
+        return NextQuestionResponse(
+            session_id=session.id,
+            is_completed=True,
+            question=None,
+            progress={"total_questions": len(session.questions), "status": "completed"},
+            message="Interview session is completed."
+        )
+
+    # Find first question without an answer
+    unanswered_question = next((q for q in session.questions if not q.answer), None)
+
+    if not unanswered_question:
+        return NextQuestionResponse(
+            session_id=session.id,
+            is_completed=True,
+            question=None,
+            progress={"total_questions": len(session.questions), "status": "completed"},
+            message="All questions answered. Ready for summary."
+        )
+
+    return NextQuestionResponse(
+        session_id=session.id,
+        is_completed=False,
+        question=QuestionItemResponse(
+            id=unanswered_question.id,
+            session_id=unanswered_question.session_id,
+            question_text=unanswered_question.question_text,
+            topic=unanswered_question.topic,
+            difficulty=unanswered_question.difficulty,
+            order_index=unanswered_question.order_index,
+            source_chunk_ids=unanswered_question.source_chunk_ids,
+            created_at=unanswered_question.created_at
+        ),
+        progress={
+            "current_index": unanswered_question.order_index + 1,
+            "total_topics": len(session.topics_planned),
+            "max_questions": settings.MAX_QUESTIONS_PER_SESSION
+        }
+    )
+
+
+@router.post("/sessions/{session_id}/answer", response_model=SubmitAnswerResponse, tags=["Interview Flow"])
+async def submit_answer(
+    session_id: str,
+    payload: SubmitAnswerRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Submits a candidate's answer for evaluation.
+    Judges the response, checks topic coverage, and generates the next question or final summary.
+    """
+    # Fetch session, candidate, and questions with answers
+    stmt = (
+        select(InterviewSession)
+        .options(
+            selectinload(InterviewSession.candidate),
+            selectinload(InterviewSession.questions).selectinload(Question.answer)
+        )
+        .where(InterviewSession.id == session_id)
+    )
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if session.status == "completed":
+        raise HTTPException(status_code=400, detail="Interview session is already completed.")
+
+    # Find target question
+    question = next((q for q in session.questions if q.id == payload.question_id), None)
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found in this session")
+
+    if question.answer:
+        raise HTTPException(status_code=400, detail="This question has already been answered.")
+
+    # Reconstruct graph state from DB history
+    qa_history = []
+    topic_coverage = {}
+    for t in session.topics_planned:
+        topic_coverage[t.get("topic")] = {"attempts": 0, "max_depth": "none", "covered": False}
+
+    for past_q in sorted(session.questions, key=lambda x: x.order_index):
+        if past_q.answer:
+            qa_history.append({
+                "question": {
+                    "question": past_q.question_text,
+                    "topic": past_q.topic,
+                    "difficulty": past_q.difficulty,
+                    "source_chunk_ids": past_q.source_chunk_ids
+                },
+                "answer_text": past_q.answer.answer_text,
+                "judge_verdict": past_q.answer.judge_verdict
+            })
+            matched_t = past_q.topic if past_q.topic in topic_coverage else None
+            if not matched_t:
+                for k in topic_coverage.keys():
+                    if past_q.topic.lower().strip() in k.lower().strip() or k.lower().strip() in past_q.topic.lower().strip():
+                        matched_t = k
+                        break
+            if matched_t:
+                topic_coverage[matched_t]["attempts"] += 1
+                v_depth = past_q.answer.judge_verdict.get("depth", "insufficient")
+                if v_depth in ["adequate", "deep"]:
+                    topic_coverage[matched_t]["covered"] = True
+                    topic_coverage[matched_t]["max_depth"] = v_depth
+
+    # Accurately determine current topic index from the question being answered
+    curr_topic_idx = 0
+    for i, t in enumerate(session.topics_planned or []):
+        t_name = t.get("topic", "") if isinstance(t, dict) else str(t)
+        if t_name == question.topic or question.topic in t_name or t_name in question.topic:
+            curr_topic_idx = i
+            break
+
+    current_state: InterviewState = {
+        "session_id": session.id,
+        "candidate_id": session.candidate.id,
+        "candidate_name": session.candidate.name,
+        "role": session.role,
+        "resume_raw_text": session.candidate.resume_raw_text or "",
+        "resume_profile": session.candidate.resume_profile or {},
+        "topics_planned": session.topics_planned,
+        "current_topic_index": curr_topic_idx,
+        "current_difficulty": question.difficulty,
+        "retrieved_chunks": question.source_chunk_ids or [],
+        "current_question": {
+            "question": question.question_text,
+            "topic": question.topic,
+            "difficulty": question.difficulty,
+            "source_chunks_detail": question.source_chunk_ids
+        },
+        "last_answer_text": payload.answer_text,
+        "last_judge_verdict": None,
+        "qa_history": qa_history,
+        "topic_coverage": topic_coverage,
+        "questions_count": len(qa_history),
+        "is_completed": False,
+        "final_summary": None,
+        "error": None
+    }
+
+    # Run state machine transition
+    updated_state = step_process_answer(current_state, payload.answer_text)
+
+    decision = updated_state.get("turn_decision", {})
+    action = decision.get("action", "advance")
+    interviewer_reply = decision.get("interviewer_reply")
+
+    if action == "stay":
+        # Candidate greeted, uttered noise, or asked for clarification/hint.
+        # Do NOT persist an Answer or create a new Question. Stay on the current question!
+        return SubmitAnswerResponse(
+            answer_id=f"stay_{question.id}",
+            question_id=question.id,
+            judge_verdict=None,
+            is_session_completed=False,
+            next_question=None,
+            action="stay",
+            interviewer_reply=interviewer_reply,
+            progress={
+                "answered_count": len(qa_history),
+                "max_questions": settings.MAX_QUESTIONS_PER_SESSION,
+                "topic_coverage": updated_state.get("topic_coverage", {})
+            }
+        )
+
+    # Persist Answer & Judge Verdict
+    judge_verdict_data = updated_state.get("last_judge_verdict") or {}
+    answer = Answer(
+        question_id=question.id,
+        answer_text=payload.answer_text,
+        judge_verdict=judge_verdict_data
+    )
+    db.add(answer)
+    await db.flush()
+
+    is_completed = updated_state.get("is_completed", False) or (action == "conclude")
+    next_question_item = None
+
+    if is_completed:
+        session.status = "completed"
+        session.completed_at = get_utc_now()
+        summary_data = updated_state.get("final_summary", {})
+        
+        # Save session summary
+        summary = SessionSummary(
+            session_id=session.id,
+            summary_text=summary_data.get("summary_text", "Interview completed."),
+            strengths=summary_data.get("strengths", []),
+            gaps=summary_data.get("gaps", []),
+            next_steps=summary_data.get("next_steps", []),
+            recommendation=summary_data.get("overall_recommendation")
+        )
+        db.add(summary)
+    else:
+        # Save newly generated question
+        next_q_data = updated_state.get("current_question")
+        if next_q_data:
+            next_order_index = len(session.questions)
+            next_q = Question(
+                session_id=session.id,
+                question_text=next_q_data.get("question_text") or next_q_data.get("question", ""),
+                topic=next_q_data.get("topic", "System Design"),
+                difficulty=next_q_data.get("difficulty", "mid"),
+                source_chunk_ids=next_q_data.get("source_chunks_detail", []),
+                order_index=next_order_index
+            )
+            db.add(next_q)
+            await db.flush()
+            await db.refresh(next_q)
+
+            next_question_item = QuestionItemResponse(
+                id=next_q.id,
+                session_id=next_q.session_id,
+                question_text=next_q.question_text,
+                topic=next_q.topic,
+                difficulty=next_q.difficulty,
+                order_index=next_q.order_index,
+                source_chunk_ids=next_q.source_chunk_ids,
+                created_at=next_q.created_at
+            )
+
+    await db.commit()
+
+    return SubmitAnswerResponse(
+        answer_id=answer.id,
+        question_id=question.id,
+        judge_verdict=JudgeVerdict(**judge_verdict_data) if judge_verdict_data else None,
+        is_session_completed=is_completed,
+        next_question=next_question_item,
+        action=action,
+        interviewer_reply=interviewer_reply,
+        progress={
+            "answered_count": len(qa_history) + 1,
+            "max_questions": settings.MAX_QUESTIONS_PER_SESSION,
+            "topic_coverage": updated_state.get("topic_coverage", {})
+        }
+    )
+
+
+@router.post("/sessions/{session_id}/end", response_model=SessionSummaryResponse, tags=["Interview Flow"])
+async def end_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Explicitly ends an interview session and triggers executive evaluation and summary synthesis.
+    """
+    stmt = (
+        select(InterviewSession)
+        .options(
+            selectinload(InterviewSession.candidate),
+            selectinload(InterviewSession.questions).selectinload(Question.answer),
+            selectinload(InterviewSession.summary)
+        )
+        .where(InterviewSession.id == session_id)
+    )
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    if session.summary:
+        return SessionSummaryResponse(
+            session_id=session.summary.session_id,
+            summary_text=session.summary.summary_text,
+            strengths=session.summary.strengths,
+            gaps=session.summary.gaps,
+            next_steps=session.summary.next_steps,
+            overall_recommendation=session.summary.recommendation,
+            generated_at=session.summary.generated_at
+        )
+
+    # Reconstruct QA history for summarization
+    qa_history = []
+    for past_q in sorted(session.questions, key=lambda x: x.order_index):
+        if past_q.answer:
+            qa_history.append({
+                "question": {
+                    "question": past_q.question_text,
+                    "topic": past_q.topic,
+                    "difficulty": past_q.difficulty,
+                    "source_chunk_ids": past_q.source_chunk_ids
+                },
+                "answer_text": past_q.answer.answer_text,
+                "judge_verdict": past_q.answer.judge_verdict
+            })
+
+    current_state: InterviewState = {
+        "session_id": session.id,
+        "candidate_id": session.candidate.id,
+        "candidate_name": session.candidate.name,
+        "role": session.role,
+        "resume_raw_text": session.candidate.resume_raw_text or "",
+        "resume_profile": session.candidate.resume_profile or {},
+        "topics_planned": session.topics_planned or [],
+        "qa_history": qa_history,
+        "is_completed": True
+    }
+
+    summary_result = summarize_node(current_state)
+    summary_data = summary_result.get("final_summary", {})
+
+    session.status = "completed"
+    session.completed_at = get_utc_now()
+    summary = SessionSummary(
+        session_id=session.id,
+        summary_text=summary_data.get("summary_text", "Interview completed."),
+        strengths=summary_data.get("strengths", []),
+        gaps=summary_data.get("gaps", []),
+        next_steps=summary_data.get("next_steps", [])
+    )
+    db.add(summary)
+    await db.commit()
+
+    return SessionSummaryResponse(
+        session_id=summary.session_id,
+        summary_text=summary.summary_text,
+        strengths=summary.strengths,
+        gaps=summary.gaps,
+        next_steps=summary.next_steps,
+        generated_at=summary.generated_at
+    )
+
+
+@router.get("/sessions/{session_id}/summary", response_model=SessionSummaryResponse, tags=["Interview Flow"])
+async def get_session_summary(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Fetches the final evaluated summary for a completed interview.
+    """
+    stmt = (
+        select(SessionSummary)
+        .where(SessionSummary.session_id == session_id)
+    )
+    res = await db.execute(stmt)
+    summary = res.scalar_one_or_none()
+    if not summary:
+        raise HTTPException(status_code=404, detail="Summary not found for this session. It may still be in progress.")
+
+    return SessionSummaryResponse(
+        session_id=summary.session_id,
+        summary_text=summary.summary_text,
+        strengths=summary.strengths,
+        gaps=summary.gaps,
+        next_steps=summary.next_steps,
+        generated_at=summary.generated_at
+    )
+
+
+@router.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse, tags=["Traceability & Audit"])
+async def get_session_history(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Returns full Q&A transcript with source chunk traceability and judge verdicts.
+    """
+    stmt = (
+        select(InterviewSession)
+        .options(
+            selectinload(InterviewSession.candidate),
+            selectinload(InterviewSession.questions).selectinload(Question.answer),
+            selectinload(InterviewSession.summary)
+        )
+        .where(InterviewSession.id == session_id)
+    )
+    res = await db.execute(stmt)
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    qa_pairs = []
+    for q in sorted(session.questions, key=lambda x: x.order_index):
+        qa_pairs.append(HistoryQAItem(
+            question_id=q.id,
+            question_text=q.question_text,
+            topic=q.topic,
+            difficulty=q.difficulty,
+            order_index=q.order_index,
+            source_chunks=q.source_chunk_ids or [],
+            answer_id=q.answer.id if q.answer else None,
+            answer_text=q.answer.answer_text if q.answer else None,
+            judge_verdict=q.answer.judge_verdict if q.answer else None
+        ))
+
+    summary_resp = None
+    if session.summary:
+        summary_resp = SessionSummaryResponse(
+            session_id=session.summary.session_id,
+            summary_text=session.summary.summary_text,
+            strengths=session.summary.strengths,
+            gaps=session.summary.gaps,
+            next_steps=session.summary.next_steps,
+            generated_at=session.summary.generated_at
+        )
+
+    return SessionHistoryResponse(
+        session_id=session.id,
+        role=session.role,
+        candidate_name=session.candidate.name,
+        status=session.status,
+        resume_profile=session.candidate.resume_profile or {},
+        topics_planned=session.topics_planned or [],
+        qa_pairs=qa_pairs,
+        summary=summary_resp
+    )
+
+
+
+================================================================================
+FILE 11/12: backend/app/graph/state.py
+DESCRIPTION: Backend State Models (Turn, InterviewState, InsightEntry)
+================================================================================
+
+from pydantic import BaseModel, Field, validator
+from typing import List, Dict, Any, Optional, Literal
+from uuid import uuid4
+from datetime import datetime
+
+
+class Turn(BaseModel):
+    """
+    Unified turn object for both voice and text modalities.
+    The graph never knows which modality produced this turn.
+    Runtime validation ensures data integrity.
+    """
+    turn_id: str = Field(default_factory=lambda: str(uuid4()))
+    modality: Literal["voice", "text"]
+    normalized_text: str
+    asr_confidence: float = 1.0
+    interruption_flag: bool = False
+    
+    @validator('asr_confidence')
+    def validate_confidence(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"asr_confidence must be between 0 and 1, got {v}")
+        return v
+
+
+class InsightEntry(BaseModel):
+    """Evidence-linked claim for insight generation."""
+    topic: str
+    claim: str
+    evidence: str
+    observation: str
+
+
+class InterviewState(BaseModel):
+    """
+    Strongly typed state with runtime validation per spec §2.
+    Pydantic provides runtime type checking, default values, and validation.
+    """
+    # Context (pre-seeded)
+    session_id: str = Field(default_factory=lambda: str(uuid4()))
+    candidate_name: str = ""
+    resume_summary: str = ""
+    role_context: str = ""
+    
+    # Conversation
+    message_history: List[Dict[str, Any]] = Field(default_factory=list)
+    current_topic: Optional[str] = None
+    topics_covered: List[str] = Field(default_factory=list)
+    turn_count: int = 0
+    current_phase: Literal[
+        "INIT", "OPENING", "QUESTION_DELIVERY", "WAIT_FOR_TURN",
+        "CLASSIFY_AND_EVALUATE", "CLARIFY_UNCERTAIN", "ESCALATE_PIVOT",
+        "COVERAGE_CHECK", "WRAPUP", "INSIGHT_GENERATION", "CLOSED", "ERROR_RECOVERY"
+    ] = "INIT"
+    
+    # Evaluation
+    answer_quality: Optional[float] = None
+    evaluation_confidence: float = 0.0
+    candidate_confidence: Optional[float] = None
+    hedging_detected: bool = False
+    question_quality_flag: bool = True
+    contradicts_resume_flag: bool = False
+    
+    # Escalation
+    difficulty_level: Literal["junior", "mid", "senior"] = "junior"
+    consecutive_strong: int = 0
+    consecutive_weak: int = 0
+    topic_sub_state: Dict[str, Any] = Field(default_factory=dict)
+    
+    # Uncertainty
+    uncertainty_type: Optional[Literal[
+        "asr_low_conf", "candidate_hedging", "silence_timeout", 
+        "off_topic", "ambiguous", "meta_question"
+    ]] = None
+    unresolved_retry_count: int = 0
+    
+    # Delivery
+    question_delivery_state: Literal["fully_delivered", "interrupted"] = "fully_delivered"
+    agent_speaking_flag: bool = False
+    
+    # Insight
+    insight_buffer: List[InsightEntry] = Field(default_factory=list)
+    
+    # Current cycle state
+    current_question: Optional[Dict[str, Any]] = None
+    last_turn: Optional[Turn] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
+        extra = "ignore"  # Gracefully handle extra fields from checkpoints
+
+    def prune_history(self, max_turns: int = 50):
+        """
+        Prevent memory leaks by pruning old history while keeping context.
+        Called periodically to bound memory usage in long sessions.
+        """
+        if len(self.message_history) > max_turns * 2:  # Only prune when significantly over limit
+            # Keep system prompt + last N turns
+            system_msgs = [m for m in self.message_history if m.get("role") == "system"]
+            non_system_msgs = [m for m in self.message_history if m.get("role") != "system"]
+            
+            # Keep most recent messages
+            recent_msgs = non_system_msgs[-max_turns:]
+            
+            self.message_history = system_msgs + recent_msgs
+    
+    def add_to_history(self, role: str, content: str):
+        """Safely add message to history with automatic pruning."""
+        self.message_history.append({"role": role, "content": content, "timestamp": datetime.utcnow().isoformat()})
+        self.turn_count += 1
+        
+        # Prune if getting too large
+        if len(self.message_history) > 100:
+            self.prune_history(max_turns=50)
+
+
+
+================================================================================
+FILE 12/12: backend/app/config.py
+DESCRIPTION: Backend System Configuration & Credentials Loader
+================================================================================
+
+"""
+Aptus Backend Configuration
+Central application settings managed via Pydantic BaseSettings.
+Supports environment variable overrides and .env loading.
+"""
+
+import os
+from pathlib import Path
+from typing import List
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Core platform configuration for Aptus screening service."""
+    PROJECT_NAME: str = "Aptus — AI Candidate Screening System"
+    API_V1_STR: str = "/api"
+    
+    # Google Gemini LLM
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    
+    # Groq STT (free tier)
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    
+    # Google Cloud TTS (free tier standard voice)
+    GOOGLE_CLOUD_CREDENTIALS: str = os.getenv("GOOGLE_CLOUD_CREDENTIALS", "")
+    
+    # Database (Async SQLite / PostgreSQL)
+    DATABASE_URL: str = "sqlite+aiosqlite:///./screening.db"
+    
+    # Filesystem Paths
+    BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
+    DATA_DIR: Path = BASE_DIR / "data"
+    CORPUS_DIR: Path = DATA_DIR / "corpus"
+    INDEX_DIR: Path = DATA_DIR / "indexes"
+    
+    # Embeddings & FAISS Vector Search
+    EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
+    CHUNK_SIZE: int = 600
+    CHUNK_OVERLAP: int = 90
+    TOP_K_CHUNKS: int = 3
+    
+    # Interview Flow Rules
+    MAX_QUESTIONS_PER_SESSION: int = 6
+    TOPICS_TARGET_DEPTH: int = 1
+    
+    # Supported Technical Roles
+    ROLES: List[str] = [
+        "AI/ML Engineer",
+        "Data Science / Applied ML",
+        "Backend Engineer"
+    ]
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+
+settings = Settings()
+
+# Ensure runtime directories exist
+settings.CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+settings.INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+
+

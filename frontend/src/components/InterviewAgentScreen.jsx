@@ -7,7 +7,7 @@ import {
   Check, Circle, Loader2,
   ListTodo, X, Send, LogOut
 } from 'lucide-react';
-import { useInterviewAgent } from '../voice/useInterviewAgent';
+import { useInterviewAgent } from '../hooks/useInterviewAgent';
 import { S } from '../voice/interviewAgent';
 
 function InterviewAgentScreen({
@@ -40,26 +40,12 @@ function InterviewAgentScreen({
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [agent.history, agent.liveTranscript]);
 
-  // Auto-start interview on mount
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (!agent.hasStarted) {
-        agent.start();
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, []);
-
   const handleOrbClick = async () => {
     if (!agent.hasStarted) {
       await agent.start();
       return;
     }
-    if (agent.isSpeaking) {
-      await agent.interrupt();
-    } else {
-      await agent.toggleMic();
-    }
+    await agent.toggleMic();
   };
 
   const handleTextSubmit = async (e) => {
@@ -80,7 +66,7 @@ function InterviewAgentScreen({
   const coveredTodos = agent.plan?.todos.filter(t => t.status === 'covered' || t.status === 'reviewed') || [];
   const totalTodos = agent.plan?.todos.length || 0;
   const isBusy = agent.isProcessing || agent.isPlanning;
-  const canSend = !isBusy && !agent.isComplete && (inputText.trim() || agent.liveTranscript.trim());
+  const canSend = agent.hasStarted && !isBusy && !agent.isComplete && (inputText.trim() || agent.liveTranscript.trim());
 
   return (
     <div style={{
@@ -450,7 +436,7 @@ function InterviewAgentScreen({
           onFocus={() => setIsFocused(true)}
           onBlur={() => setIsFocused(false)}
           onKeyDown={handleKeyDown}
-          disabled={agent.isComplete || isBusy}
+          disabled={!agent.hasStarted || agent.isComplete || isBusy}
           placeholder={
             isBusy
               ? "Evaluating response..."
@@ -501,7 +487,7 @@ function InterviewAgentScreen({
             <Mic size={16} />
           )}
           <span>
-            {agent.isListening ? 'Listening...' : agent.isSpeaking ? 'Interrupt' : 'Voice'}
+            {agent.isListening ? 'Stop & send' : agent.isSpeaking ? 'Speak' : agent.hasStarted ? 'Voice' : 'Start'}
           </span>
         </button>
 

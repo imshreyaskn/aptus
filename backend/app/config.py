@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api"
     
     # Google Gemini LLM
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
     
     # Groq STT (free tier)
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")

@@ -176,9 +176,11 @@ export class InterviewAgent {
     this.abortController = null;
     this.listenerRestarts = 0;
     this.isSubmitting = false;
+    this._destroyed = false;
+    this._submissionToken = 0;
 
     // Listener instance (single, reused)
-    this.listener = new VoiceListener({ silenceTimeoutMs: SILENCE_TIMEOUT_MS, autoVAD: true });
+    this.listener = new VoiceListener({ autoVAD: false, continuous: false, interimResults: true });
     this._wireListener();
 
     // Machine hooks
@@ -209,7 +211,7 @@ export class InterviewAgent {
   get state() { return this.machine.state; }
   get snapshot() { return this.machine.current; }
   get isSupported() { return VoiceListener.isSupported(); }
-  get isListening() { return Boolean(this.listener?.isListening); }
+  get isListening() { return Boolean(this.listener?.isRecording); }
 
   /** Kick off the interview. Call once after mount. */
   async start() {
@@ -256,7 +258,9 @@ export class InterviewAgent {
   async handleUserInput(text) {
     const trimmed = text?.trim();
     if (!trimmed) return;
-    if (this.isSubmitting) return;
+    if (this.isSubmitting || this._destroyed || this.machine.state === S.COMPLETE || this.machine.state === S.WRAPPING_UP) return;
+    this.isSubmitting = true;
+    const submissionToken = ++this._submissionToken;
 
     // Immediately stop any TTS audio playing right now
     stopAudio();
@@ -265,23 +269,27 @@ export class InterviewAgent {
     await this._processUserAnswer(trimmed);
   }
 
+  async submitText(text) {
+    await this.handleUserInput(text);
+  }
+
   /** Manual mic toggle from UI button. Mic only listens when candidate explicitly activates it. */
   async toggleMic() {
     if (this.isListening) {
-      // User tapped mic while it was active: capture what was transcribed and submit
-      const captured = (this.listener.finalTranscript + ' ' + this.listener.interimTranscript).trim();
-      this._stopListening();
-      if (captured.length > 2) {
-        await this.handleUserInput(captured);
+      // Button release ends the recording. Await backend STT before submitting.
+      const captured = await this._stopListening();
+      if (captured?.trim()) {
+        await this.handleUserInput(captured.trim());
       } else {
         this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
       }
-    } else {
-      // User tapped Voice button: stop any TTS and activate mic
-      stopAudio();
-      this._stopListening();
-      await this._startListening();
+      return;
     }
+
+    // Button press starts push-to-talk. If TTS is active, this is a manual interrupt.
+    stopAudio();
+    await this._stopListening();
+    await this._startListening();
   }
 
   /** Interrupt the speaking agent (user tapped orb or pressed key). */
@@ -315,6 +323,7 @@ export class InterviewAgent {
     stopAudio();
     this._stopListening();
     this.abortController?.abort();
+    ++this._submissionToken;
     this.isSubmitting = false;
     await this._wrapUp();
   }
@@ -323,6 +332,8 @@ export class InterviewAgent {
   destroy() {
     stopAudio();
     this._stopListening();
+    this._destroyed = true;
+    ++this._submissionToken;
     this.machine.reset('Agent destroyed');
     this.abortController?.abort();
   }
@@ -358,34 +369,13 @@ export class InterviewAgent {
     };
 
     this.listener.onEnd = () => {
-      if (
-        this.machine.state === S.AWAITING_RESPONSE ||
-        this.machine.state === S.CLARIFYING ||
-        this.machine.state === S.INTERRUPTED
-      ) {
-        this._handleListenerRestart();
-      }
+      this.onVolume?.(0);
+      // Push-to-talk: stopping is intentional. Never auto-restart the mic.
     };
   }
 
   async _handleListenerRestart() {
-    this.listenerRestarts++;
-    if (this.listenerRestarts > MAX_LISTENER_RESTARTS) {
-      this.machine.transition(S.ERROR, 'Microphone unavailable after repeated failures.');
-      this.onError?.('Mic stopped responding. Switching to text input.');
-      this.listenerRestarts = 0;
-      return;
-    }
-    await new Promise(r => setTimeout(r, 400));
-    if (
-      this.machine.state === S.AWAITING_RESPONSE ||
-      this.machine.state === S.CLARIFYING ||
-      this.machine.state === S.INTERRUPTED
-    ) {
-      try {
-        await this.listener.start();
-      } catch (_) {}
-    }
+    // Retained for compatibility with older callers. Push-to-talk never auto-restarts.
   }
 
   async _finishSpeaking() {
@@ -415,9 +405,9 @@ export class InterviewAgent {
     }
   }
 
-  _stopListening() {
-    try { this.listener.stop(); } catch (_) {}
-    this.onVolume?.(0);
+  async _stopListening() {
+    try { return await this.listener.stop(); } catch (_) { return ''; }
+    finally { this.onVolume?.(0); }
   }
 
   async _handleInterruption(text) {
@@ -465,7 +455,7 @@ export class InterviewAgent {
         ac.signal
       );
 
-      if (ac.signal.aborted) return;
+      if (ac.signal.aborted || submissionToken !== this._submissionToken || this._destroyed) return;
 
       if (result?.action === 'stay') {
         const reply = result.interviewer_reply || "Whenever you're ready, let me know your thoughts on this topic.";
@@ -496,7 +486,7 @@ export class InterviewAgent {
       console.error('[InterviewAgent] Submit answer failed:', err);
       this.machine.transition(S.RECOVERING, 'Network error. Retrying...');
       await this._safeSpeak('I had a connection issue. Let me repeat the question.');
-      await this._speakQuestion(this.currentQuestion);
+      await this._repeatCurrentQuestion();
     } finally {
       this.isSubmitting = false;
     }
@@ -520,6 +510,16 @@ export class InterviewAgent {
     const text = question.question_text || question.question || '';
     await this._addToHistory('interviewer', text);
     this.machine.transition(S.SPEAKING, 'Asking question...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _repeatCurrentQuestion() {
+    if (!this.currentQuestion) return;
+    const text = this.currentQuestion.question_text || this.currentQuestion.question || '';
+    this.machine.transition(S.SPEAKING, 'Repeating the question...');
     await this._safeSpeak(text);
     if (this.machine.state === S.SPEAKING) {
       await this._finishSpeaking();
@@ -621,4 +621,3 @@ export class InterviewAgent {
 }
 
 export default InterviewAgent;
-

@@ -1,0 +1,4286 @@
+================================================================================
+APTUS FRONTEND - COMBINED SOURCE CODE
+================================================================================
+
+TABLE OF CONTENTS:
+ - Dockerfile
+ - index.html
+ - package.json
+ - src\App.jsx
+ - src\api.js
+ - src\components\InterviewAgentScreen.jsx
+ - src\components\LandingScreen.jsx
+ - src\components\ResultsScreen.jsx
+ - src\components\SetupScreen.jsx
+ - src\components\TraceabilityModal.jsx
+ - src\hooks\useInterviewAgent.js
+ - src\index.css
+ - src\main.jsx
+ - src\voice\interviewAgent.js
+ - src\voice\listener.js
+ - src\voice\speaker.js
+ - src\voice\useInterviewAgent.js
+ - vite.config.js
+
+================================================================================
+
+/* --- START FILE: Dockerfile --- */
+// File: frontend/Dockerfile
+
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+COPY package.json ./
+RUN npm install
+
+COPY . ./
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+
+/* --- END FILE: Dockerfile --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: index.html --- */
+// File: frontend/index.html
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%236366f1'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aptus — AI Candidate Screening System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Felipa&family=Geist+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  </head>
+  <body>
+
+
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+
+/* --- END FILE: index.html --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: package.json --- */
+// File: frontend/package.json
+
+{
+  "name": "aptus-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lucide-react": "^0.395.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "vite": "^5.3.1"
+  }
+}
+
+
+/* --- END FILE: package.json --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\App.jsx --- */
+// File: frontend/src\App.jsx
+
+import React, { useState } from 'react';
+import LandingScreen from './components/LandingScreen';
+import SetupScreen from './components/SetupScreen';
+import InterviewAgentScreen from './components/InterviewAgentScreen';
+import ResultsScreen from './components/ResultsScreen';
+import { startInterview, getNextQuestion, submitAnswer, endSession, getSessionSummary, getSessionHistory } from './api';
+
+function App() {
+  const [screen, setScreen] = useState('landing'); // 'landing' | 'setup' | 'interview' | 'results'
+  const [interviewMode, setInterviewMode] = useState('voice'); // 'voice' | 'text'
+  
+  // Staged Setup State
+  const [candidateName, setCandidateName] = useState('');
+  const [selectedRole, setSelectedRole] = useState('AI/ML Engineer');
+  const [resumeText, setResumeText] = useState('');
+
+
+  // Active Interview State
+  const [session, setSession] = useState(null);
+  const [currentQuestion, setCurrentQuestion] = useState(null);
+  const [topicCoverage, setTopicCoverage] = useState({});
+  const [lastVerdict, setLastVerdict] = useState(null);
+  
+  // Results State
+  const [summary, setSummary] = useState(null);
+  const [history, setHistory] = useState(null);
+
+  // Loading States
+  const [isStarting, setIsStarting] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isLoadingResults, setIsLoadingResults] = useState(false);
+
+  // 1. Start Interview Handler
+  const handleStartInterview = async ({ name, role, resumeText: rt, resumeFile }) => {
+    setIsStarting(true);
+    if (rt) setResumeText(rt); // lift for interview agent context
+    try {
+      const data = await startInterview({
+        name: name || candidateName || 'Candidate',
+        role: role || selectedRole,
+        resumeText: rt,
+        resumeFile
+      });
+      setSession(data);
+
+      // Initialize initial topic coverage map
+      const initialCoverage = {};
+      (data.topics_planned || []).forEach(t => {
+        initialCoverage[t.topic] = { attempts: 0, covered: false };
+      });
+      setTopicCoverage(initialCoverage);
+
+      // Fetch first question
+      const qRes = await getNextQuestion(data.session_id);
+      if (qRes.question) {
+        setCurrentQuestion(qRes.question);
+        setScreen('interview');
+      } else {
+        throw new Error('No question generated for session.');
+      }
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+
+  // 2. Submit Answer Handler
+  const handleSubmitAnswer = async (questionId, answerText) => {
+    if (!session) return;
+    setIsSubmitting(true);
+    try {
+      const res = await submitAnswer(session.session_id, questionId, answerText);
+      setLastVerdict(res.judge_verdict);
+
+      if (res.progress?.topic_coverage) {
+        setTopicCoverage(res.progress.topic_coverage);
+      }
+
+      if (res.is_session_completed) {
+        // Let InterviewAgent play closing TTS and invoke onComplete when done
+      } else if (res.next_question) {
+        setCurrentQuestion(res.next_question);
+      }
+      return res;
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // 3. Load Results
+  const loadResults = async (sessionId) => {
+    setIsLoadingResults(true);
+    try {
+      let sumRes = await endSession(sessionId).catch(() => null);
+      if (!sumRes) {
+        sumRes = await getSessionSummary(sessionId).catch(() => null);
+      }
+      const histRes = await getSessionHistory(sessionId).catch(() => null);
+      setSummary(sumRes);
+      setHistory(histRes);
+      setScreen('results');
+    } finally {
+      setIsLoadingResults(false);
+    }
+  };
+
+  // Reset to Landing
+  const handleReset = () => {
+    setSession(null);
+    setCurrentQuestion(null);
+    setTopicCoverage({});
+    setLastVerdict(null);
+    setSummary(null);
+    setHistory(null);
+    setCandidateName('');
+    setSelectedRole('AI/ML Engineer');
+    setResumeText('');
+    setScreen('landing');
+  };
+
+
+  const isEntryPhase = screen === 'landing' || screen === 'setup';
+
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--color-base)' }}>
+      {/* Main Content Area */}
+      <main style={{
+        flex: 1,
+        padding: screen === 'results' ? '32px 0 64px' : '0',
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: isEntryPhase ? 'center' : 'flex-start'
+      }}>
+        {screen === 'landing' && (
+          <LandingScreen
+            onGetStarted={(name) => {
+              setCandidateName(name);
+              setScreen('setup');
+            }}
+          />
+        )}
+
+        {screen === 'setup' && (
+          <SetupScreen
+            candidateName={candidateName}
+            selectedRole={selectedRole}
+            onSelectRole={(role) => setSelectedRole(role)}
+            onStartInterview={handleStartInterview}
+            onBack={() => setScreen('landing')}
+            isStarting={isStarting}
+          />
+        )}
+
+        {screen === 'interview' && currentQuestion && (
+          <InterviewAgentScreen
+            session={session}
+            candidateName={candidateName}
+            selectedRole={selectedRole}
+            resumeText={resumeText}
+            currentQuestion={currentQuestion}
+            onSubmitAnswer={handleSubmitAnswer}
+            onComplete={() => loadResults(session.session_id)}
+          />
+        )}
+
+
+        {screen === 'results' && (
+          <ResultsScreen
+            summary={summary}
+            history={history}
+            onReset={handleReset}
+          />
+        )}
+
+        {isLoadingResults && (
+          <div className="layout-container" style={{ padding: '64px 24px' }}>
+            <h2 className="text-h2" style={{ marginBottom: '8px' }}>
+              Synthesizing evaluation report
+            </h2>
+            <p className="text-body" style={{ color: 'var(--color-muted)' }}>
+              Aggregating Q&A transcript, judge evaluations, and topic coverage across literature chunks.
+            </p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default App;
+
+
+
+/* --- END FILE: src\App.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\api.js --- */
+// File: frontend/src\api.js
+
+/**
+ * Aptus Frontend API Client
+ * Type-annotated async HTTP client communicating with FastAPI backend endpoints.
+ */
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
+/**
+ * Helper to unwrap JSON error messages from FastAPI responses.
+ * @param {Response} res
+ * @param {string} fallbackMsg
+ * @returns {Promise<Error>}
+ */
+async function createApiError(res, fallbackMsg) {
+  const errorData = await res.json().catch(() => ({}));
+  const message = errorData.detail || errorData.message || fallbackMsg;
+  const err = new Error(message);
+  err.status = res.status;
+  return err;
+}
+
+/**
+ * Checks system health and supported roles.
+ * @returns {Promise<{ status: string, timestamp: string, gemini_model: string, roles: string[] }>}
+ */
+export async function checkHealth() {
+  const res = await fetch(`${API_BASE_URL}/health`);
+  if (!res.ok) throw await createApiError(res, 'Health check failed');
+  return res.json();
+}
+
+/**
+ * Fetches list of available screening domain tracks.
+ * @returns {Promise<{ roles: string[], description: string }>}
+ */
+export async function fetchRoles() {
+  const res = await fetch(`${API_BASE_URL}/roles`);
+  if (!res.ok) throw await createApiError(res, 'Failed to fetch roles');
+  return res.json();
+}
+
+/**
+ * Initializes a new interview screening session.
+ * @param {Object} params
+ * @param {string} params.name - Candidate name (letters only)
+ * @param {string} params.role - Target role title
+ * @param {string|null} [params.resumeText] - Raw pasted resume text
+ * @param {File|null} [params.resumeFile] - Uploaded PDF resume file
+ * @returns {Promise<Object>} StartInterviewResponse
+ */
+export async function startInterview({ name, role, resumeText, resumeFile }) {
+  const formData = new FormData();
+  formData.append('name', name || 'Candidate');
+  formData.append('role', role);
+  if (resumeText) {
+    formData.append('resume_text', resumeText);
+  }
+  if (resumeFile) {
+    formData.append('resume_file', resumeFile);
+  }
+
+  const res = await fetch(`${API_BASE_URL}/sessions/start`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to start interview session');
+  }
+
+  return res.json();
+}
+
+/**
+ * Retrieves the next question or completion status for an active session.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} NextQuestionResponse
+ */
+export async function getNextQuestion(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/next-question`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch next question');
+  }
+  return res.json();
+}
+
+/**
+ * Submits a candidate answer for real-time evaluation and next-question generation.
+ * @param {string} sessionId
+ * @param {string} questionId
+ * @param {string} answerText
+ * @param {AbortSignal} [signal] - Optional abort signal
+ * @returns {Promise<Object>} SubmitAnswerResponse
+ */
+export async function submitAnswer(sessionId, questionId, answerText, signal) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/answer`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      question_id: questionId,
+      answer_text: answerText,
+    }),
+    signal,
+  });
+
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to submit answer');
+  }
+
+  return res.json();
+}
+
+/**
+ * Explicitly terminates an interview session and triggers executive evaluation synthesis.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionSummaryResponse
+ */
+export async function endSession(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/end`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to end session');
+  }
+  return res.json();
+}
+
+/**
+ * Fetches the executive evaluation report for a completed session.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionSummaryResponse
+ */
+export async function getSessionSummary(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/summary`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch summary');
+  }
+  return res.json();
+}
+
+/**
+ * Synthesizes natural speech using Google Cloud TTS.
+ * @param {string} text - Text to synthesize
+ * @param {string} [languageCode='en-US'] - Language code
+ * @returns {Promise<Blob>} Audio blob (MP3)
+ */
+export async function synthesizeSpeech(text, languageCode = 'en-US') {
+  const res = await fetch(`${API_BASE_URL}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, language_code: languageCode }),
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'TTS synthesis failed');
+  }
+  return res.blob();
+}
+
+/**
+ * Transcribes audio recording using backend Groq Whisper STT API.
+ * @param {Blob} audioBlob - Recorded audio blob
+ * @param {string} [language='en'] - Language code
+ * @returns {Promise<{ text: string, confidence: number, segments: Array }>}
+ */
+export async function transcribeAudio(audioBlob, language = 'en') {
+  const formData = new FormData();
+  formData.append('audio', audioBlob, 'recording.webm');
+  formData.append('language', language);
+
+  const res = await fetch(`${API_BASE_URL}/stt`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'STT transcription failed');
+  }
+  return res.json();
+}
+
+/**
+ * Fetches full Q&A transcript with judge verdicts and literature chunk traceability.
+ * @param {string} sessionId
+ * @returns {Promise<Object>} SessionHistoryResponse
+ */
+export async function getSessionHistory(sessionId) {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/history`);
+  if (!res.ok) {
+    throw await createApiError(res, 'Failed to fetch history');
+  }
+  return res.json();
+}
+
+
+/* --- END FILE: src\api.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\components\InterviewAgentScreen.jsx --- */
+// File: frontend/src\components\InterviewAgentScreen.jsx
+
+// frontend/src/components/InterviewAgentScreen.jsx
+// Clean chat + voice interview interface styled consistently with the landing page
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Mic, Volume2, Pause,
+  Check, Circle, Loader2,
+  ListTodo, X, Send, LogOut
+} from 'lucide-react';
+import { useInterviewAgent } from '../hooks/useInterviewAgent';
+import { S } from '../voice/interviewAgent';
+
+function InterviewAgentScreen({
+  session,
+  candidateName,
+  selectedRole,
+  resumeText,
+  currentQuestion,
+  onSubmitAnswer,
+  onComplete,
+}) {
+  const [inputText, setInputText] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const [isPlanOpen, setIsPlanOpen] = useState(false);
+  const chatBottomRef = useRef(null);
+  const inputRef = useRef(null);
+
+  const agent = useInterviewAgent({
+    session,
+    candidateName,
+    role: selectedRole,
+    resumeText,
+    currentQuestion,
+    onSubmitAnswer,
+    onComplete,
+  });
+
+  // Auto-scroll chat on new messages or live transcripts
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [agent.history, agent.liveTranscript]);
+
+  const handleOrbClick = async () => {
+    if (!agent.hasStarted) {
+      await agent.start();
+      return;
+    }
+    await agent.toggleMic();
+  };
+
+  const handleTextSubmit = async (e) => {
+    e?.preventDefault();
+    const text = inputText.trim() || agent.liveTranscript.trim();
+    if (!text) return;
+    setInputText('');
+    await agent.submitText(text);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleTextSubmit();
+    }
+  };
+
+  const coveredTodos = agent.plan?.todos.filter(t => t.status === 'covered' || t.status === 'reviewed') || [];
+  const totalTodos = agent.plan?.todos.length || 0;
+  const isBusy = agent.isProcessing || agent.isPlanning;
+  const canSend = agent.hasStarted && !isBusy && !agent.isComplete && (inputText.trim() || agent.liveTranscript.trim());
+
+  return (
+    <div style={{
+      maxWidth: '680px',
+      width: '100%',
+      margin: '0 auto',
+      height: '100vh',
+      display: 'flex',
+      flexDirection: 'column',
+      position: 'relative',
+      padding: '24px 16px 20px',
+      boxSizing: 'border-box'
+    }}>
+
+      {/* ── Top Center Aptus Wordmark ── */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '0 0 16px',
+        flexShrink: 0,
+        position: 'relative'
+      }}>
+        <h1 className="text-wordmark" style={{ fontSize: '28px', margin: 0, lineHeight: '1.0', letterSpacing: '-0.02em' }}>
+          Aptus
+        </h1>
+
+        {/* Header Action Buttons (top right) */}
+        <div style={{ position: 'absolute', right: 0, top: '2px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {totalTodos > 0 && (
+            <button
+              type="button"
+              onClick={() => setIsPlanOpen(!isPlanOpen)}
+              className="btn-liquid-glass"
+              style={{
+                padding: '6px 12px',
+                fontSize: '12px',
+                borderRadius: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}
+            >
+              <ListTodo size={13} />
+              <span>Plan ({coveredTodos.length}/{totalTodos})</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => agent.forceEnd()}
+            disabled={agent.isComplete || agent.state === S.WRAPPING_UP}
+            className="btn-liquid-glass"
+            style={{
+              padding: '6px 12px',
+              fontSize: '12px',
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              color: 'var(--color-text-secondary)',
+              cursor: 'pointer'
+            }}
+            title="End interview and view evaluation summary"
+          >
+            <LogOut size={13} />
+            <span>End</span>
+          </button>
+        </div>
+        {/* Toast: voice-unavailable / error info */}
+        {agent.errorMessage && (
+          <div style={{
+            position: 'absolute',
+            bottom: '-2px',
+            left: 0,
+            right: 0,
+            display: 'flex',
+            justifyContent: 'center'
+          }}>
+            <span style={{
+              fontSize: '11px',
+              color: 'var(--color-text-secondary)',
+              background: 'rgba(243,240,233,0.9)',
+              borderRadius: '6px',
+              padding: '3px 10px',
+              border: '1px solid var(--color-border)'
+            }}>
+              {agent.errorMessage}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* ── Slide-down Interview Plan Overlay ── */}
+      {isPlanOpen && (
+        <div style={{
+          position: 'absolute',
+          top: '56px',
+          left: '16px',
+          right: '16px',
+          backgroundColor: 'rgba(253, 252, 248, 0.96)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          border: '1px solid var(--color-border)',
+          borderRadius: '16px',
+          padding: '20px',
+          boxShadow: '0 16px 36px rgba(16, 16, 16, 0.12)',
+          zIndex: 50,
+          maxHeight: '70vh',
+          overflowY: 'auto'
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+            <span style={{ fontSize: '13px', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Planned Assessment Topics
+            </span>
+            <button
+              onClick={() => setIsPlanOpen(false)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '4px', color: 'var(--color-text-secondary)' }}
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {agent.plan?.todos?.map((todo) => {
+              const isCovered = todo.status === 'covered';
+              const isProbing = todo.status === 'probing';
+              const isReviewed = todo.status === 'reviewed';
+
+              return (
+                <div
+                  key={todo.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    padding: '10px 12px',
+                    borderRadius: '10px',
+                    backgroundColor: isCovered
+                      ? 'rgba(22, 163, 74, 0.05)'
+                      : isProbing
+                      ? 'rgba(217, 119, 6, 0.06)'
+                      : 'var(--color-base)',
+                    border: isProbing
+                      ? '1px solid rgba(217, 119, 6, 0.3)'
+                      : '1px solid var(--color-border)'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                    <div style={{ marginTop: '2px' }}>
+                      {isCovered ? (
+                        <Check size={14} color="#16a34a" strokeWidth={2.5} />
+                      ) : isProbing ? (
+                        <Circle size={14} color="#d97706" strokeWidth={2.5} />
+                      ) : isReviewed ? (
+                        <Check size={14} color="var(--color-text-muted)" strokeWidth={2} />
+                      ) : (
+                        <Circle size={14} color="var(--color-text-muted)" strokeWidth={1.5} />
+                      )}
+                    </div>
+                    <div>
+                      <div style={{
+                        fontSize: '13px',
+                        fontWeight: '500',
+                        color: isCovered
+                          ? '#15803d'
+                          : isProbing
+                          ? '#b45309'
+                          : isReviewed
+                          ? 'var(--color-text-muted)'
+                          : 'var(--color-text)'
+                      }}>
+                        {todo.area}
+                      </div>
+                      {todo.intent && (
+                        <p style={{ fontSize: '11.5px', color: 'var(--color-text-secondary)', margin: '2px 0 0', lineHeight: 1.4 }}>
+                          {todo.intent}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <span style={{
+                    fontSize: '10.5px',
+                    fontWeight: '600',
+                    padding: '2px 8px',
+                    borderRadius: '6px',
+                    flexShrink: 0,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.04em',
+                    backgroundColor: isCovered
+                      ? 'rgba(22, 163, 74, 0.12)'
+                      : isProbing
+                      ? 'rgba(217, 119, 6, 0.15)'
+                      : isReviewed
+                      ? 'rgba(100, 116, 139, 0.1)'
+                      : 'rgba(0, 0, 0, 0.04)',
+                    color: isCovered
+                      ? '#15803d'
+                      : isProbing
+                      ? '#b45309'
+                      : isReviewed
+                      ? 'var(--color-text-muted)'
+                      : 'var(--color-text-secondary)'
+                  }}>
+                    {isCovered ? 'Mastered' : isProbing ? 'Probing (2nd Attempt)' : isReviewed ? 'Evaluated' : 'Upcoming'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Main Chat Log ── */}
+      <div style={{
+        flex: 1,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        padding: '12px 4px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        gap: '16px'
+      }}>
+        {/* Welcome message when starting */}
+        {agent.history.length === 0 && (
+          <div style={{
+            alignSelf: 'flex-start',
+            maxWidth: '85%',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px'
+          }}>
+            <div style={{
+              padding: '14px 18px',
+              borderRadius: '20px 20px 20px 4px',
+              backgroundColor: 'rgba(255, 255, 255, 0.7)',
+              backdropFilter: 'blur(16px)',
+              WebkitBackdropFilter: 'blur(16px)',
+              border: '1px solid rgba(255, 255, 255, 0.95)',
+              boxShadow: '0 8px 24px -4px rgba(16, 16, 16, 0.08), inset 0 1px 1px 0 rgba(255, 255, 255, 1)',
+              lineHeight: 1.6,
+              fontSize: '14.5px',
+              color: 'var(--color-text)'
+            }}>
+              Hi {candidateName || 'there'}! Type your answer below, or click Voice when you'd like to speak.
+            </div>
+          </div>
+        )}
+
+        {/* History Dialogue Bubbles */}
+        {agent.history.map((turn, idx) => {
+          const isInterviewer = turn.role === 'interviewer';
+          return (
+            <div
+              key={idx}
+              style={{
+                alignSelf: isInterviewer ? 'flex-start' : 'flex-end',
+                maxWidth: '85%',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px'
+              }}
+            >
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                paddingLeft: isInterviewer ? '4px' : 0,
+                paddingRight: isInterviewer ? 0 : '4px',
+                justifyContent: isInterviewer ? 'flex-start' : 'flex-end'
+              }}>
+                <span style={{ fontSize: '10.5px', color: 'var(--color-text-muted)' }}>
+                  {turn.timestamp}
+                </span>
+              </div>
+
+              <div style={{
+                padding: '14px 18px',
+                borderRadius: isInterviewer ? '20px 20px 20px 4px' : '20px 20px 4px 20px',
+                backgroundColor: isInterviewer
+                  ? 'rgba(255, 255, 255, 0.75)'
+                  : 'var(--color-ivory)',
+                backdropFilter: 'blur(16px)',
+                WebkitBackdropFilter: 'blur(16px)',
+                border: '1px solid rgba(255, 255, 255, 0.95)',
+                boxShadow: isInterviewer
+                  ? '0 8px 24px -4px rgba(16, 16, 16, 0.08), inset 0 1.5px 1px 0 rgba(255, 255, 255, 1)'
+                  : '0 8px 20px -4px rgba(16, 16, 16, 0.06), inset 0 1px 1px 0 rgba(255, 255, 255, 0.8)',
+                lineHeight: 1.6,
+                fontSize: isInterviewer ? '14.5px' : '14px',
+                color: 'var(--color-text)'
+              }}>
+                {turn.text}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Live Interim Transcript Bubble */}
+        {agent.liveTranscript && (
+          <div style={{
+            alignSelf: 'flex-end',
+            maxWidth: '85%',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px'
+          }}>
+            <div style={{
+              padding: '12px 16px',
+              borderRadius: '20px 20px 4px 20px',
+              backgroundColor: 'rgba(37, 99, 235, 0.04)',
+              border: '1.5px dashed rgba(37, 99, 235, 0.35)',
+              color: 'var(--color-text)',
+              fontSize: '14px',
+              fontStyle: 'italic',
+              lineHeight: 1.5
+            }}>
+              "{agent.liveTranscript}"
+            </div>
+          </div>
+        )}
+
+        <div ref={chatBottomRef} />
+      </div>
+
+      {/* ── Shared Status Indicator (Common place for evaluating/processing/loading) ── */}
+      {(isBusy || agent.state === S.WRAPPING_UP) && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '8px',
+          padding: '6px 0 2px',
+          color: 'var(--color-text-secondary)',
+          fontSize: '12.5px',
+          flexShrink: 0
+        }}>
+          <Loader2 size={14} className="spin-anim" />
+          <span>
+            {agent.state === S.WRAPPING_UP
+              ? 'Synthesizing evaluation report...'
+              : agent.snapshot?.message || 'Evaluating your response...'}
+          </span>
+        </div>
+      )}
+
+      {/* ── Input + Voice Row Styled Like the Landing Screen ── */}
+      <form
+        onSubmit={handleTextSubmit}
+        style={{
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          padding: '8px 0 4px',
+          flexShrink: 0
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="text"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          onKeyDown={handleKeyDown}
+          disabled={!agent.hasStarted || agent.isComplete || isBusy}
+          placeholder={
+            isBusy
+              ? "Evaluating response..."
+              : agent.isListening
+              ? "Listening... (speak or type response)"
+              : "Type your answer (or click Voice)..."
+          }
+          style={{
+            flex: 1,
+            background: 'transparent',
+            border: 'none',
+            borderLeft: isFocused
+              ? '1.5px solid var(--color-obsidian-100)'
+              : '1.5px solid var(--color-border)',
+            outline: 'none',
+            fontSize: '14px',
+            fontFamily: 'var(--font-sans)',
+            color: 'var(--color-text)',
+            padding: '8px 2px 8px 12px',
+            textAlign: 'left',
+            transition: 'border-color 150ms ease-out'
+          }}
+        />
+
+        {/* Voice Button Styled as Landing Page Button */}
+        <button
+          type="button"
+          onClick={handleOrbClick}
+          disabled={isBusy || agent.isComplete}
+          className="btn-liquid-glass"
+          style={{
+            padding: '8px 18px',
+            fontSize: '13.5px',
+            borderRadius: '10px',
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            color: agent.isListening ? '#2563eb' : 'var(--color-text)',
+            opacity: (isBusy || agent.isComplete) ? 0.6 : 1
+          }}
+        >
+          {agent.isSpeaking ? (
+            <Volume2 size={16} />
+          ) : agent.isListening ? (
+            <Mic size={16} color="#2563eb" />
+          ) : (
+            <Mic size={16} />
+          )}
+          <span>
+            {agent.isListening ? 'Stop & send' : agent.isSpeaking ? 'Speak' : agent.hasStarted ? 'Voice' : 'Start'}
+          </span>
+        </button>
+
+        {/* Send Button Styled as Landing Page Button with paper plane SVG */}
+        <button
+          type="submit"
+          disabled={!canSend}
+          className="btn-liquid-glass"
+          style={{
+            padding: '8px 18px',
+            fontSize: '13.5px',
+            borderRadius: '10px',
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            opacity: canSend ? 1 : 0.4
+          }}
+        >
+          <Send size={13} />
+          <span>Send</span>
+        </button>
+      </form>
+
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        .spin-anim { animation: spin 1s linear infinite; }
+      `}</style>
+    </div>
+  );
+}
+
+export default InterviewAgentScreen;
+
+
+/* --- END FILE: src\components\InterviewAgentScreen.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\components\LandingScreen.jsx --- */
+// File: frontend/src\components\LandingScreen.jsx
+
+import React, { useState, useEffect } from 'react';
+
+const CATCHPHRASES = [
+  "Interviews designed by people who hate bad interviews.",
+  "Talk systems with an interviewer that actually did the reading.",
+  "Less whiteboard cosplay. More actual engineering.",
+  "No trick questions. Just the stuff that actually breaks in production.",
+  "Skip the theater. Show how you build."
+];
+
+const NAME_REGEX = /^[A-Za-z]+$/;
+
+export default function LandingScreen({ onGetStarted }) {
+  const [name, setName] = useState('');
+  const [error, setError] = useState(null);
+  const [isFocused, setIsFocused] = useState(false);
+  const [phraseIndex, setPhraseIndex] = useState(0);
+  const [isFading, setIsFading] = useState(false);
+
+  useEffect(() => {
+    // 5.2s interval for relaxed readability
+    const interval = setInterval(() => {
+      setIsFading(true);
+      setTimeout(() => {
+        setPhraseIndex((prev) => (prev + 1) % CATCHPHRASES.length);
+        setIsFading(false);
+      }, 250);
+    }, 5200);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    setError(null);
+    const trimmed = name.trim();
+
+    if (!trimmed) {
+      setError('Please enter your name.');
+      return;
+    }
+
+    if (!NAME_REGEX.test(trimmed)) {
+      setError('Name must contain only letters (no numbers or spaces).');
+      return;
+    }
+
+    console.log(`[Aptus Landing] Candidate name entered: "${trimmed}"`);
+    onGetStarted(trimmed);
+  };
+
+  return (
+    <div style={{
+      minHeight: '80vh',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: '0 24px',
+      textAlign: 'center'
+    }}>
+      {/* Title & Cycling Catchphrase (64px gap) */}
+      <div style={{ marginBottom: '64px' }}>
+        <h1 className="text-wordmark" style={{ fontSize: '64px', marginBottom: '0px', lineHeight: '1.0', letterSpacing: '-0.02em' }}>
+          Aptus
+        </h1>
+        <div style={{ height: '24px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginTop: '4px' }}>
+          <p
+            className="text-body"
+            style={{
+              color: 'var(--color-text-secondary)',
+              maxWidth: '460px',
+              margin: '0 auto',
+              opacity: isFading ? 0 : 1,
+              transform: isFading ? 'translateY(2px)' : 'translateY(0)',
+              transition: 'opacity 250ms ease-out, transform 250ms ease-out'
+            }}
+          >
+            {CATCHPHRASES[phraseIndex]}
+          </p>
+        </div>
+      </div>
+
+      {/* Borderless Entry (No outer bounding box) */}
+      <form
+        onSubmit={handleSubmit}
+        style={{
+          width: '100%',
+          maxWidth: '360px',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '12px'
+        }}
+      >
+        <div style={{
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '16px'
+        }}>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (error) setError(null);
+            }}
+            onFocus={() => setIsFocused(true)}
+            onBlur={() => setIsFocused(false)}
+            placeholder="what should we call you?"
+            style={{
+              flex: 1,
+              background: 'transparent',
+              border: 'none',
+              borderLeft: error
+                ? '1.5px solid #d9383a'
+                : isFocused
+                ? '1.5px solid var(--color-obsidian-100)'
+                : '1.5px solid var(--color-border)',
+              outline: 'none',
+              fontSize: '14px',
+              fontFamily: 'var(--font-sans)',
+              color: 'var(--color-text)',
+              padding: '6px 2px 6px 12px',
+              textAlign: 'left',
+              transition: 'border-color 150ms ease-out'
+            }}
+          />
+
+          <button
+            type="submit"
+            onClick={handleSubmit}
+            className="btn-liquid-glass"
+            style={{
+              padding: '8px 20px',
+              fontSize: '13.5px',
+              borderRadius: '10px',
+              flexShrink: 0
+            }}
+          >
+            Let's go
+          </button>
+        </div>
+
+        {error && (
+          <span className="text-micro-data" style={{ color: '#d9383a', textAlign: 'left', alignSelf: 'flex-start', paddingLeft: '4px' }}>
+            {error}
+          </span>
+        )}
+      </form>
+    </div>
+  );
+}
+
+
+/* --- END FILE: src\components\LandingScreen.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\components\ResultsScreen.jsx --- */
+// File: frontend/src\components\ResultsScreen.jsx
+
+import React, { useState } from 'react';
+import { ChevronDown, ChevronUp, ArrowRight, BookOpen, CheckCircle2, AlertCircle, Award, Sparkles } from 'lucide-react';
+import TraceabilityModal from './TraceabilityModal';
+
+export default function ResultsScreen({
+  summary,
+  history,
+  onReset
+}) {
+  const [selectedQAForTrace, setSelectedQAForTrace] = useState(null);
+  const [expandedQA, setExpandedQA] = useState({});
+
+  const toggleQA = (idx) => {
+    setExpandedQA(prev => ({
+      ...prev,
+      [idx]: !prev[idx]
+    }));
+  };
+
+  const candidateName = history?.candidate_name || 'Candidate';
+  const role = history?.role || 'Technical Role';
+  const qaPairs = history?.qa_pairs || [];
+
+  const answeredQAs = qaPairs.filter(qa => qa.answer_text && qa.answer_text.trim().length > 0);
+  const answeredCount = answeredQAs.length;
+
+  // Calculate average score honestly
+  const scores = answeredQAs
+    .map(qa => qa.judge_verdict?.score)
+    .filter(s => typeof s === 'number');
+  const avgScore = scores.length > 0
+    ? (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1)
+    : '—';
+
+  const totalPlanned = history?.topics_planned?.length || Math.max(1, qaPairs.length);
+  const completionPercent = totalPlanned > 0 ? Math.min(100, Math.round((answeredCount / totalPlanned) * 100)) : 0;
+  const completionStatus = completionPercent >= 100 ? 'COMPLETE' : completionPercent === 0 ? '0%' : `${completionPercent}%`;
+
+  const radius = 36;
+  const circumference = 2 * Math.PI * radius;
+  const strokeDashoffset = circumference - (completionPercent / 100) * circumference;
+
+  const numAvgScore = scores.length > 0 ? (scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+
+  const defaultSummaryText = answeredCount === 0
+    ? `The screening session for ${candidateName} was concluded before any technical questions were answered. No evaluation score could be determined.`
+    : numAvgScore < 4.0
+    ? `${candidateName} completed ${answeredCount} screening round(s) with an average rating of ${avgScore}/10. Responses did not demonstrate sufficient technical depth or conceptual understanding for ${role}.`
+    : `${candidateName} completed ${answeredCount} screening round(s), demonstrating relevant foundational knowledge across targeted topics.`;
+
+  const defaultStrengths = answeredCount === 0
+    ? ['Interview session initialized with candidate background and curriculum roadmap.']
+    : numAvgScore < 4.0
+    ? ['Completed session evaluation across initial curriculum areas.']
+    : ['Demonstrated initial familiarity with core technical topics.'];
+
+  const defaultGaps = answeredCount === 0
+    ? ['No responses were recorded to evaluate technical depth or engineering trade-offs.']
+    : numAvgScore < 4.0
+    ? ['Responses lacked technical explanation, algorithmic depth, and architectural trade-offs.', 'Did not answer targeted questions on fundamental principles.']
+    : ['Further technical rounds recommended to assess complete syllabus coverage.'];
+
+  const defaultNextSteps = answeredCount === 0
+    ? ['Schedule a complete technical screening interview.', `Review foundational literature in ${role}.`]
+    : numAvgScore < 4.0
+    ? [`Comprehensive review of foundational ${role} literature and architectures recommended.`, 'Re-application advised after fundamental technical skill development.']
+    : ['Deepen practical hands-on implementation and system trade-offs.', 'Proceed to technical architecture design round.'];
+
+  const recommendation = summary?.overall_recommendation || (numAvgScore >= 7.0 ? 'Strong Hire' : numAvgScore >= 5.5 ? 'Hire' : numAvgScore >= 4.0 ? 'Needs Further Evaluation' : answeredCount === 0 ? 'Incomplete' : 'No Hire');
+
+  const recColors = {
+    'Strong Hire': { bg: 'rgba(34, 197, 94, 0.12)', text: '#15803d', border: 'rgba(34, 197, 94, 0.3)' },
+    'Hire': { bg: 'rgba(34, 197, 94, 0.10)', text: '#16a34a', border: 'rgba(34, 197, 94, 0.25)' },
+    'Lean Hire': { bg: 'rgba(234, 179, 8, 0.12)', text: '#a16207', border: 'rgba(234, 179, 8, 0.3)' },
+    'Needs Further Evaluation': { bg: 'rgba(245, 158, 11, 0.12)', text: '#b45309', border: 'rgba(245, 158, 11, 0.3)' },
+    'No Hire': { bg: 'rgba(239, 68, 68, 0.12)', text: '#b91c1c', border: 'rgba(239, 68, 68, 0.3)' },
+    'Incomplete': { bg: 'rgba(107, 114, 128, 0.12)', text: '#4b5563', border: 'rgba(107, 114, 128, 0.3)' },
+  };
+  const badgeStyle = recColors[recommendation] || recColors['Needs Further Evaluation'];
+
+  return (
+    <div style={{
+      maxWidth: '780px',
+      width: '100%',
+      margin: '0 auto',
+      padding: '32px 16px 80px',
+      boxSizing: 'border-box',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '24px'
+    }}>
+
+      {/* ── Candidate Name Header & Recommendation Badge ── */}
+      <div style={{ textAlign: 'center', margin: '16px 0 8px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
+        <h1 className="text-wordmark" style={{ fontSize: '56px', margin: 0, lineHeight: '1.0', letterSpacing: '-0.02em' }}>
+          {candidateName}
+        </h1>
+        <div style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '6px',
+          padding: '4px 14px',
+          borderRadius: '999px',
+          fontSize: '13px',
+          fontWeight: '600',
+          letterSpacing: '0.02em',
+          textTransform: 'uppercase',
+          background: badgeStyle.bg,
+          color: badgeStyle.text,
+          border: `1px solid ${badgeStyle.border}`
+        }}>
+          <span>Verdict: {recommendation}</span>
+        </div>
+      </div>
+
+      {/* ── Hero Metric Panel (Unified Glass Card) ── */}
+      <div style={{
+        background: 'linear-gradient(135deg, rgba(255, 255, 255, 0.90) 0%, rgba(243, 240, 233, 0.65) 50%, rgba(255, 255, 255, 0.85) 100%)',
+        backdropFilter: 'blur(20px)',
+        WebkitBackdropFilter: 'blur(20px)',
+        border: '1px solid rgba(255, 255, 255, 0.95)',
+        borderRadius: '20px',
+        padding: '24px',
+        boxShadow: '0 12px 28px -4px rgba(16, 16, 16, 0.08), inset 0 1.5px 1px 0 rgba(255, 255, 255, 1)',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: '20px',
+        alignItems: 'center'
+      }}>
+        {/* Metric 1: Overall Performance Score */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <span className="text-caption" style={{ color: 'var(--color-text-secondary)', fontSize: '12px' }}>
+            Overall Rating
+          </span>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
+            <span className="text-stat" style={{ fontSize: '48px' }}>
+              {avgScore}
+            </span>
+            {avgScore !== '—' && (
+              <span className="text-body-l" style={{ color: 'var(--color-text-secondary)', fontWeight: '500' }}>
+                /10
+              </span>
+            )}
+          </div>
+          <span className="text-micro-data" style={{ color: 'var(--color-text-muted)' }}>
+            {avgScore !== '—' && Number(avgScore) >= 7 ? 'Demonstrates solid depth' : avgScore !== '—' ? 'Foundational competency' : 'No score recorded'}
+          </span>
+        </div>
+
+        {/* Metric 2: Completed Rounds */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <span className="text-caption" style={{ color: 'var(--color-text-secondary)', fontSize: '12px' }}>
+            Questions Completed
+          </span>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+            <span className="text-stat" style={{ fontSize: '48px' }}>
+              {answeredCount}
+            </span>
+            <span className="text-body-l" style={{ color: 'var(--color-text-secondary)', fontWeight: '500' }}>
+              / {totalPlanned}
+            </span>
+          </div>
+          <span className="text-micro-data" style={{ color: 'var(--color-text-muted)' }}>
+            {totalPlanned - answeredCount > 0 ? `${totalPlanned - answeredCount} topics remaining` : 'Full syllabus covered'}
+          </span>
+        </div>
+
+        {/* Metric 3: Radial Progress Indicator */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: '16px' }}>
+          <div style={{ position: 'relative', width: '80px', height: '80px', flexShrink: 0 }}>
+            <svg width="80" height="80" style={{ transform: 'rotate(-90deg)' }}>
+              <circle
+                cx="40"
+                cy="40"
+                r={radius}
+                fill="transparent"
+                stroke="var(--color-nude)"
+                strokeWidth="6"
+              />
+              <circle
+                cx="40"
+                cy="40"
+                r={radius}
+                fill="transparent"
+                stroke="var(--color-obsidian-100)"
+                strokeWidth="6"
+                strokeDasharray={circumference}
+                strokeDashoffset={strokeDashoffset}
+                strokeLinecap="round"
+                style={{ transition: 'stroke-dashoffset 400ms ease-out' }}
+              />
+            </svg>
+            <div style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}>
+              <span className="text-micro-data" style={{ fontWeight: '600', fontSize: '12px' }}>
+                {completionPercent}%
+              </span>
+            </div>
+          </div>
+          <div>
+            <span className="text-caption" style={{ display: 'block', marginBottom: '2px' }}>Syllabus</span>
+            <span className="tag-nude" style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px' }}>
+              {completionStatus}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Executive Assessment Card ── */}
+      <div style={{
+        backgroundColor: 'var(--color-ivory)',
+        borderRadius: '20px',
+        padding: '24px',
+        border: '1px solid var(--color-border)',
+        boxShadow: '0 4px 12px rgba(16, 16, 16, 0.03)'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+          <Award size={16} color="var(--color-obsidian-100)" />
+          <span className="text-caption" style={{ color: 'var(--color-obsidian-100)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            Executive Assessment
+          </span>
+        </div>
+        <p className="text-body-l" style={{ fontSize: '15px', lineHeight: '1.65', color: 'var(--color-text)', margin: 0 }}>
+          {summary?.summary_text || defaultSummaryText}
+        </p>
+      </div>
+
+      {/* ── Demonstrated Strengths & Identified Knowledge Gaps ── */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+        gap: '16px'
+      }}>
+        {/* Strengths */}
+        <div style={{
+          backgroundColor: 'rgba(255, 255, 255, 0.8)',
+          borderRadius: '20px',
+          padding: '20px 24px',
+          border: '1px solid var(--color-border)',
+          backdropFilter: 'blur(16px)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
+            <CheckCircle2 size={16} color="#16a34a" />
+            <h3 className="text-h3" style={{ fontSize: '15px', margin: 0 }}>
+              Demonstrated Strengths
+            </h3>
+          </div>
+          <ul style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '10px', padding: 0, margin: 0 }}>
+            {(summary?.strengths?.length ? summary.strengths : defaultStrengths).map((s, idx) => (
+              <li key={idx} className="text-body" style={{ fontSize: '13.5px', display: 'flex', alignItems: 'flex-start', gap: '8px', lineHeight: '1.5' }}>
+                <span style={{ color: '#16a34a', fontWeight: '600', marginTop: '-1px' }}>&bull;</span>
+                <span>{s}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {/* Gaps */}
+        <div style={{
+          backgroundColor: 'rgba(255, 255, 255, 0.8)',
+          borderRadius: '20px',
+          padding: '20px 24px',
+          border: '1px solid var(--color-border)',
+          backdropFilter: 'blur(16px)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
+            <AlertCircle size={16} color="#d97706" />
+            <h3 className="text-h3" style={{ fontSize: '15px', margin: 0 }}>
+              Identified Knowledge Gaps
+            </h3>
+          </div>
+          <ul style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '10px', padding: 0, margin: 0 }}>
+            {(summary?.gaps?.length ? summary.gaps : defaultGaps).map((g, idx) => (
+              <li key={idx} className="text-body" style={{ fontSize: '13.5px', display: 'flex', alignItems: 'flex-start', gap: '8px', lineHeight: '1.5' }}>
+                <span style={{ color: '#d97706', fontWeight: '600', marginTop: '-1px' }}>&bull;</span>
+                <span>{g}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      {/* ── Recommended Next Steps ── */}
+      <div style={{
+        backgroundColor: 'rgba(243, 240, 233, 0.5)',
+        borderRadius: '20px',
+        padding: '20px 24px',
+        border: '1px solid var(--color-border)'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+          <Sparkles size={16} color="var(--color-obsidian-100)" />
+          <h3 className="text-h3" style={{ fontSize: '15px', margin: 0 }}>
+            Recommended Next Steps
+          </h3>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {(summary?.next_steps?.length ? summary.next_steps : defaultNextSteps).map((step, idx) => (
+            <div
+              key={idx}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                padding: '10px 14px',
+                backgroundColor: 'rgba(255, 255, 255, 0.7)',
+                borderRadius: '10px',
+                border: '1px solid rgba(16, 16, 16, 0.06)'
+              }}
+            >
+              <span className="text-micro-data" style={{ color: 'var(--color-text-secondary)', fontWeight: '600' }}>
+                [0{idx + 1}]
+              </span>
+              <span className="text-body" style={{ fontSize: '13.5px' }}>
+                {step}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Interview Transcript (Accordion) ── */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+          <h2 className="text-h2" style={{ fontSize: '18px', margin: 0 }}>
+            Interview Transcript
+          </h2>
+          <span className="tag-ivory" style={{ fontSize: '11px', borderRadius: '6px' }}>
+            {qaPairs.length} {qaPairs.length === 1 ? 'Round' : 'Rounds'}
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {qaPairs.map((qa, idx) => {
+            const isExpanded = expandedQA[idx] !== false;
+            const verdict = qa.judge_verdict || {};
+            const hasAnswer = qa.answer_text && qa.answer_text.trim().length > 0;
+
+            return (
+              <div
+                key={idx}
+                style={{
+                  backgroundColor: 'rgba(255, 255, 255, 0.75)',
+                  backdropFilter: 'blur(16px)',
+                  WebkitBackdropFilter: 'blur(16px)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: '16px',
+                  overflow: 'hidden',
+                  boxShadow: '0 4px 16px -2px rgba(16, 16, 16, 0.04)'
+                }}
+              >
+                {/* Accordion Header */}
+                <div
+                  onClick={() => toggleQA(idx)}
+                  style={{
+                    padding: '14px 18px',
+                    backgroundColor: 'rgba(243, 240, 233, 0.6)',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    cursor: 'pointer',
+                    userSelect: 'none'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                    <span className="text-micro-data" style={{ fontWeight: '600', color: 'var(--color-obsidian-100)' }}>
+                      Q{idx + 1}
+                    </span>
+                    <span className="text-body" style={{ fontWeight: '500', fontSize: '13.5px' }}>
+                      {qa.topic}
+                    </span>
+                    <span className="tag-nude" style={{ fontSize: '11px', borderRadius: '6px' }}>
+                      {qa.difficulty}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    {typeof verdict.score === 'number' ? (
+                      <span className="tag-ivory" style={{ fontWeight: '600', fontSize: '11px', borderRadius: '6px' }}>
+                        SCORE: {verdict.score}/10
+                      </span>
+                    ) : (
+                      <span className="tag-ivory" style={{ fontSize: '11px', borderRadius: '6px', opacity: 0.7 }}>
+                        {hasAnswer ? 'EVALUATED' : 'UNANSWERED'}
+                      </span>
+                    )}
+                    {isExpanded ? <ChevronUp size={15} color="var(--color-text-secondary)" /> : <ChevronDown size={15} color="var(--color-text-secondary)" />}
+                  </div>
+                </div>
+
+                {/* Accordion Expanded Content */}
+                {isExpanded && (
+                  <div style={{ padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                    {/* Question Bubble */}
+                    <div style={{
+                      padding: '14px 16px',
+                      borderRadius: '14px 14px 14px 4px',
+                      backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                      border: '1px solid rgba(255, 255, 255, 0.95)',
+                      boxShadow: '0 4px 12px rgba(16, 16, 16, 0.04)'
+                    }}>
+                      <span className="text-caption" style={{ display: 'block', marginBottom: '4px', fontWeight: '500', color: 'var(--color-text-secondary)' }}>
+                        Interviewer
+                      </span>
+                      <p className="text-body" style={{ fontSize: '14px', lineHeight: '1.6', margin: 0 }}>
+                        {qa.question_text}
+                      </p>
+                    </div>
+
+                    {/* Candidate Response Bubble */}
+                    <div style={{
+                      padding: '14px 16px',
+                      borderRadius: '14px 14px 4px 14px',
+                      backgroundColor: 'var(--color-ivory)',
+                      border: '1px solid var(--color-border)',
+                      alignSelf: 'flex-end',
+                      width: '95%'
+                    }}>
+                      <span className="text-caption" style={{ display: 'block', marginBottom: '4px', fontWeight: '500', color: 'var(--color-text-secondary)' }}>
+                        Candidate Response
+                      </span>
+                      <p className="text-body" style={{ fontSize: '13.5px', lineHeight: '1.6', margin: 0, whiteSpace: 'pre-wrap', fontStyle: hasAnswer ? 'normal' : 'italic', color: hasAnswer ? 'var(--color-text)' : 'var(--color-text-muted)' }}>
+                        {qa.answer_text || 'No response recorded (ended early).'}
+                      </p>
+                    </div>
+
+                    {/* Judge Assessment */}
+                    {verdict.feedback && (
+                      <div style={{
+                        padding: '14px',
+                        backgroundColor: 'rgba(243, 240, 233, 0.4)',
+                        borderRadius: '12px',
+                        border: '1px solid var(--color-border)'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap', gap: '6px' }}>
+                          <span className="text-caption" style={{ fontWeight: '600', color: 'var(--color-text)' }}>
+                            Judge Assessment
+                          </span>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            {verdict.depth && <span className="tag-nude" style={{ fontSize: '10.5px' }}>DEPTH: {verdict.depth.toUpperCase()}</span>}
+                            {verdict.correctness && <span className="tag-ivory" style={{ fontSize: '10.5px' }}>CORRECT: {verdict.correctness.toUpperCase()}</span>}
+                          </div>
+                        </div>
+                        <p className="text-body" style={{ fontSize: '13px', lineHeight: '1.5', margin: 0 }}>
+                          {verdict.feedback}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Grounding literature inspect button */}
+                    {qa.source_chunks && qa.source_chunks.length > 0 && (
+                      <div>
+                        <button
+                          type="button"
+                          className="btn-liquid-glass"
+                          onClick={() => setSelectedQAForTrace(qa)}
+                          style={{
+                            padding: '6px 14px',
+                            fontSize: '12px',
+                            borderRadius: '8px',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px'
+                          }}
+                        >
+                          <BookOpen size={13} />
+                          <span>Inspect {qa.source_chunks.length} reference literature chunks</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Reset / Start New Screening Action ── */}
+      <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'center' }}>
+        <button
+          onClick={onReset}
+          className="btn-liquid-glass"
+          style={{
+            width: '100%',
+            maxWidth: '380px',
+            padding: '14px 28px',
+            fontSize: '14.5px',
+            borderRadius: '12px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '8px'
+          }}
+        >
+          <span>Begin New Candidate Screening</span>
+          <ArrowRight size={15} />
+        </button>
+      </div>
+
+      {/* ── Traceability Modal ── */}
+      <TraceabilityModal
+        isOpen={!!selectedQAForTrace}
+        onClose={() => setSelectedQAForTrace(null)}
+        question={selectedQAForTrace}
+        chunks={selectedQAForTrace?.source_chunks}
+      />
+    </div>
+  );
+}
+
+
+/* --- END FILE: src\components\ResultsScreen.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\components\SetupScreen.jsx --- */
+// File: frontend/src\components\SetupScreen.jsx
+
+import React, { useState } from 'react';
+import { AlertCircle, ArrowLeft, ArrowRight, Upload, Check, FileText } from 'lucide-react';
+
+const ROLES = [
+  {
+    id: 'AI/ML Engineer',
+    title: 'AI/ML Engineer',
+    book: "Tom Mitchell's ML + Hundred-Page ML Book"
+  },
+  {
+    id: 'Data Science / Applied ML',
+    title: 'Data Science / Applied ML',
+    book: 'Introduction to ML with Python'
+  },
+  {
+    id: 'Backend Engineer',
+    title: 'Backend Engineer',
+    book: 'Distributed Systems & Architecture Corpus'
+  }
+];
+
+const getSampleResume = (name) => `${name || 'Candidate'} | Senior AI/ML Engineer
+${(name || 'candidate').toLowerCase()}@example.com | San Francisco, CA
+
+PROFESSIONAL SUMMARY
+Machine Learning Engineer with 5+ years of experience designing and deploying large-scale deep learning models, RAG systems, and high-throughput inference pipelines. Strong background in loss function optimization, transformer architectures, and PyTorch.
+
+TECHNICAL SKILLS
+- Languages: Python, C++, SQL
+- Frameworks: PyTorch, JAX, HuggingFace Transformers, LangChain, FAISS
+- Core Concepts: Backpropagation, Optimization (AdamW, SGD), Regularization, Distributed Training
+- Infrastructure: Docker, Kubernetes, Triton Inference Server, AWS SageMaker
+
+EXPERIENCE
+Senior ML Engineer — Apex AI (2022 - Present)
+- Architected vector search and RAG retrieval pipelines reducing query latency by 40%.
+- Fine-tuned transformer models for domain-specific classification and reasoning tasks.
+- Implemented custom loss functions and learning rate schedulers to mitigate vanishing gradients.`;
+
+const NAME_REGEX = /^[A-Za-z]+$/;
+
+/**
+ * SetupScreen component
+ * Allows candidate track selection and resume ingestion (PDF upload or raw text paste).
+ * 
+ * @param {Object} props
+ * @param {string} props.candidateName - Official candidate name
+ * @param {string} props.selectedRole - Currently selected track
+ * @param {Function} props.onSelectRole - Callback when role changes
+ * @param {Function} props.onStartInterview - Callback to initiate interview session
+ * @param {Function} props.onBack - Callback to return to landing screen
+ * @param {boolean} props.isStarting - Loading state during session initialization
+ */
+export default function SetupScreen({
+  candidateName,
+  selectedRole,
+  onSelectRole,
+  onStartInterview,
+  onBack,
+  isStarting
+}) {
+  const [role, setRole] = useState(selectedRole || ROLES[0].id);
+  const [inputMode, setInputMode] = useState('paste'); // 'paste' | 'upload'
+  const [resumeText, setResumeText] = useState(() => getSampleResume(candidateName));
+  const [resumeFile, setResumeFile] = useState(null);
+  const [isFocused, setIsFocused] = useState(false);
+  const [error, setError] = useState(null);
+
+  const charCount = resumeText.length;
+  const wordCount = resumeText.trim() ? resumeText.trim().split(/\s+/).length : 0;
+
+  const handleRoleChange = (newRole) => {
+    setRole(newRole);
+    onSelectRole?.(newRole);
+    console.log(`[Aptus Setup] Track selected: ${newRole}`);
+  };
+
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setResumeFile(file);
+      console.log(`[Aptus Setup] Resume file selected: "${file.name}" (${(file.size / 1024).toFixed(1)} KB)`);
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError(null);
+
+    const activeName = (candidateName || 'Candidate').trim();
+    if (!NAME_REGEX.test(activeName)) {
+      const msg = 'Candidate name must contain only letters (no numbers or spaces).';
+      setError(msg);
+      console.warn(`[Aptus Setup] Name validation failed: "${activeName}" does not match /^[A-Za-z]+$/`);
+      return;
+    }
+
+    if (inputMode === 'upload' && !resumeFile) {
+      setError('Select a resume PDF file before continuing.');
+      return;
+    }
+    if (inputMode === 'paste' && !resumeText.trim()) {
+      setError('Enter candidate resume text.');
+      return;
+    }
+
+    console.log(`[Aptus Setup] Initiating Begin Session:`, {
+      name: activeName,
+      role,
+      inputMode,
+      file: resumeFile?.name || null,
+      textLength: inputMode === 'paste' ? resumeText.length : null
+    });
+
+    try {
+      await onStartInterview({
+        name: activeName,
+        role: role,
+        resumeText: inputMode === 'paste' ? resumeText : null,
+        resumeFile: inputMode === 'upload' ? resumeFile : null,
+      });
+      console.log(`[Aptus Setup] Session successfully initialized!`);
+    } catch (err) {
+      console.error(`[Aptus Setup] Begin Session failed:`, err);
+      setError(err.message || 'Failed to start interview');
+    }
+  };
+
+  return (
+    <div style={{
+      width: 'min(1140px, calc(100vw - 64px))',
+      margin: '0 auto',
+      padding: '36px 0 64px',
+      boxSizing: 'border-box',
+      display: 'flex',
+      flexDirection: 'column'
+    }}>
+      {/* Top Bar: Back Button */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'flex-start',
+        alignItems: 'center',
+        marginBottom: '28px'
+      }}>
+        <button
+          type="button"
+          onClick={onBack}
+          className="btn-ghost"
+          style={{
+            padding: '6px 12px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '8px',
+            fontSize: '13px',
+            borderRadius: '8px'
+          }}
+        >
+          <ArrowLeft size={14} />
+          <span>Back</span>
+        </button>
+      </div>
+
+      {/* Header Section */}
+      <div style={{ marginBottom: '36px', textAlign: 'left' }}>
+        <h1 className="text-wordmark" style={{ fontSize: '40px', lineHeight: '1.1', marginBottom: '8px', letterSpacing: '-0.02em' }}>
+          Configure session
+        </h1>
+        <p className="text-body" style={{ fontSize: '14.5px', color: 'var(--color-text-secondary)', margin: 0 }}>
+          Select your track and attach candidate experience.
+        </p>
+      </div>
+
+      {error && (
+        <div style={{
+          backgroundColor: 'var(--color-ivory)',
+          borderLeft: '2px solid var(--color-obsidian-100)',
+          padding: '10px 14px',
+          marginBottom: '24px',
+          width: '100%',
+          textAlign: 'left',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          boxSizing: 'border-box'
+        }}>
+          <AlertCircle size={15} color="var(--color-text)" />
+          <span className="text-body" style={{ fontSize: '13px' }}>{error}</span>
+        </div>
+      )}
+
+      {/* Main Workspace Grid (40% Target Track / 60% Candidate Background) */}
+      <form onSubmit={handleSubmit} style={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
+        <div style={{
+          width: '100%',
+          display: 'grid',
+          gridTemplateColumns: 'minmax(300px, 38%) 1fr',
+          gap: '40px',
+          alignItems: 'stretch',
+          marginBottom: '40px',
+          textAlign: 'left'
+        }}>
+          {/* Left Column: Target Track (Tighter Vertical Density ~68px per item) */}
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              marginBottom: '14px',
+              paddingBottom: '8px',
+              borderBottom: '1px solid var(--color-border)'
+            }}>
+              <span style={{
+                fontSize: '11px',
+                fontWeight: '600',
+                textTransform: 'uppercase',
+                letterSpacing: '0.08em',
+                color: 'var(--color-text)'
+              }}>
+                Target Track
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {ROLES.map((r) => {
+                const isSelected = role === r.id;
+                return (
+                  <div
+                    key={r.id}
+                    onClick={() => handleRoleChange(r.id)}
+                    style={{
+                      padding: '12px 16px',
+                      minHeight: '64px',
+                      cursor: 'pointer',
+                      borderLeft: isSelected
+                        ? '2px solid var(--color-obsidian-100)'
+                        : '1.5px solid var(--color-border)',
+                      backgroundColor: isSelected ? 'var(--color-ivory)' : 'transparent',
+                      borderRadius: '0 8px 8px 0',
+                      transition: 'all 140ms ease-out',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'center',
+                      boxSizing: 'border-box'
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2px' }}>
+                      <span style={{ fontSize: '14.5px', fontWeight: isSelected ? '500' : '400', color: 'var(--color-text)' }}>
+                        {r.title}
+                      </span>
+                      {isSelected && (
+                        <Check size={14} color="var(--color-obsidian-100)" strokeWidth={2.5} />
+                      )}
+                    </div>
+                    <span className="text-caption" style={{ fontSize: '11.5px', color: 'var(--color-text-secondary)', lineHeight: '1.3' }}>
+                      {r.book}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Right Column: Candidate Background */}
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '14px',
+              paddingBottom: '8px',
+              borderBottom: '1px solid var(--color-border)'
+            }}>
+              <span style={{
+                fontSize: '11px',
+                fontWeight: '600',
+                textTransform: 'uppercase',
+                letterSpacing: '0.08em',
+                color: 'var(--color-text)'
+              }}>
+                Candidate Background
+              </span>
+              <div style={{ display: 'flex', gap: '16px' }}>
+                <button
+                  type="button"
+                  onClick={() => setInputMode('paste')}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    fontSize: '12px',
+                    fontFamily: 'var(--font-sans)',
+                    color: inputMode === 'paste' ? 'var(--color-obsidian-100)' : 'var(--color-text-muted)',
+                    fontWeight: inputMode === 'paste' ? '500' : '400',
+                    cursor: 'pointer',
+                    padding: '0 0 2px 0',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '5px',
+                    borderBottom: inputMode === 'paste' ? '1.5px solid var(--color-obsidian-100)' : '1.5px solid transparent',
+                    transition: 'all 120ms ease-out'
+                  }}
+                >
+                  <FileText size={12.5} strokeWidth={1.75} />
+                  <span>Paste text</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInputMode('upload')}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    fontSize: '12px',
+                    fontFamily: 'var(--font-sans)',
+                    color: inputMode === 'upload' ? 'var(--color-obsidian-100)' : 'var(--color-text-muted)',
+                    fontWeight: inputMode === 'upload' ? '500' : '400',
+                    cursor: 'pointer',
+                    padding: '0 0 2px 0',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '5px',
+                    borderBottom: inputMode === 'upload' ? '1.5px solid var(--color-obsidian-100)' : '1.5px solid transparent',
+                    transition: 'all 120ms ease-out'
+                  }}
+                >
+                  <Upload size={12.5} strokeWidth={1.75} />
+                  <span>Upload PDF</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Editor Area with Defined Bottom (minHeight 300px) */}
+            <div style={{
+              flex: 1,
+              minHeight: '300px',
+              display: 'flex',
+              flexDirection: 'column',
+              borderLeft: isFocused || (inputMode === 'upload' && resumeFile)
+                ? '2px solid var(--color-obsidian-100)'
+                : '1.5px solid var(--color-border)',
+              padding: '6px 4px 6px 16px',
+              boxSizing: 'border-box',
+              transition: 'border-color 150ms ease-out'
+            }}>
+              {inputMode === 'paste' ? (
+                <>
+                  <textarea
+                    rows={10}
+                    value={resumeText}
+                    onChange={(e) => setResumeText(e.target.value)}
+                    onFocus={() => setIsFocused(true)}
+                    onBlur={() => setIsFocused(false)}
+                    placeholder="Paste candidate resume content here..."
+                    style={{
+                      flex: 1,
+                      width: '100%',
+                      minHeight: '235px',
+                      boxSizing: 'border-box',
+                      resize: 'none',
+                      background: 'transparent',
+                      border: 'none',
+                      outline: 'none',
+                      fontSize: '13px',
+                      fontFamily: 'var(--font-mono)',
+                      lineHeight: '1.6',
+                      color: 'var(--color-text)',
+                      whiteSpace: 'pre-wrap'
+                    }}
+                  />
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'flex-end',
+                    alignItems: 'center',
+                    paddingTop: '8px',
+                    marginTop: 'auto',
+                    borderTop: '1px solid var(--color-border)'
+                  }}>
+                    <span className="text-micro-data" style={{ color: 'var(--color-text-secondary)' }}>
+                      {charCount.toLocaleString()} characters · {wordCount.toLocaleString()} words
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div style={{
+                  flex: 1,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'center',
+                  alignItems: 'flex-start',
+                  gap: '14px',
+                  padding: '24px 0'
+                }}>
+                  <input
+                    id="resume-pdf-upload"
+                    type="file"
+                    accept=".pdf,.txt"
+                    style={{ display: 'none' }}
+                    onChange={handleFileChange}
+                  />
+                  <button
+                    type="button"
+                    className="btn-subtle"
+                    onClick={() => document.getElementById('resume-pdf-upload').click()}
+                    style={{ padding: '8px 16px', display: 'inline-flex', alignItems: 'center', gap: '8px', borderRadius: '8px' }}
+                  >
+                    <Upload size={14} />
+                    <span>{resumeFile ? 'Change selected file' : 'Select PDF / TXT document'}</span>
+                  </button>
+                  {resumeFile ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <Check size={14} color="var(--color-obsidian-100)" />
+                      <span className="text-micro-data" style={{ fontWeight: '500' }}>
+                        {resumeFile.name} ({(resumeFile.size / 1024).toFixed(1)} KB)
+                      </span>
+                    </div>
+                  ) : (
+                    <p className="text-caption" style={{ color: 'var(--color-text-secondary)', margin: 0 }}>
+                      Upload candidate resume PDF to ground the technical trajectory.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom Action Bar */}
+        <div style={{
+          paddingTop: '20px',
+          borderTop: '1px solid var(--color-border)',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          textAlign: 'left'
+        }}>
+          <div>
+            <span className="text-caption" style={{ fontWeight: '500', color: 'var(--color-text)', display: 'block' }}>
+              Session ready
+            </span>
+            <span className="text-micro-data" style={{ color: 'var(--color-text-secondary)' }}>
+              {role} · {inputMode === 'upload' && resumeFile ? `${resumeFile.name}` : `${wordCount} words attached`}
+            </span>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isStarting}
+            className="btn-liquid-glass"
+            style={{
+              width: 'auto',
+              minWidth: '180px',
+              height: '44px',
+              padding: '0 24px',
+              fontSize: '14.5px',
+              whiteSpace: 'nowrap',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '8px'
+            }}
+          >
+            <span style={{ whiteSpace: 'nowrap' }}>{isStarting ? 'Synthesizing plan...' : 'Begin Session'}</span>
+            {!isStarting && <ArrowRight size={15} style={{ flexShrink: 0 }} />}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+
+/* --- END FILE: src\components\SetupScreen.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\components\TraceabilityModal.jsx --- */
+// File: frontend/src\components\TraceabilityModal.jsx
+
+import React from 'react';
+import { X, Bookmark, BookOpen } from 'lucide-react';
+
+export default function TraceabilityModal({ isOpen, onClose, question, chunks }) {
+  if (!isOpen) return null;
+
+  const displayChunks = chunks && chunks.length > 0 
+    ? chunks 
+    : (question?.source_chunk_ids || []);
+
+  return (
+    <div style={{
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      backgroundColor: 'rgba(16, 16, 16, 0.4)',
+      backdropFilter: 'blur(16px)',
+      WebkitBackdropFilter: 'blur(16px)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 1000,
+      padding: '20px'
+    }}>
+      <div style={{
+        backgroundColor: 'var(--color-base)',
+        width: '100%',
+        maxWidth: '720px',
+        maxHeight: '85vh',
+        display: 'flex',
+        flexDirection: 'column',
+        border: '1px solid var(--color-border)',
+        borderRadius: '20px',
+        boxShadow: '0 24px 48px -12px rgba(16, 16, 16, 0.2)',
+        overflow: 'hidden'
+      }}>
+        {/* Modal Header */}
+        <div style={{
+          padding: '20px 24px',
+          borderBottom: '1px solid var(--color-border)',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          backgroundColor: 'rgba(243, 240, 233, 0.5)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <BookOpen size={18} color="var(--color-obsidian-100)" />
+            <div>
+              <h2 className="text-h2" style={{ fontSize: '18px', margin: 0 }}>
+                Literature Grounding
+              </h2>
+              <p className="text-caption" style={{ margin: 0 }}>
+                Source textbook excerpts retrieved via FAISS vector similarity
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--color-text-secondary)',
+              cursor: 'pointer',
+              padding: '6px',
+              borderRadius: '8px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Modal Body */}
+        <div style={{ padding: '24px', overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          {/* Question Summary */}
+          <div style={{
+            backgroundColor: 'var(--color-ivory)',
+            padding: '16px 18px',
+            borderRadius: '14px',
+            border: '1px solid var(--color-border)'
+          }}>
+            <span className="text-caption" style={{ display: 'block', marginBottom: '4px', fontWeight: '500' }}>
+              Target Question
+            </span>
+            <p className="text-body" style={{ fontWeight: '500', fontSize: '14px', margin: 0 }}>
+              {question?.question_text || question?.question}
+            </p>
+          </div>
+
+          {/* Retrieved Chunks List */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span className="text-caption" style={{ fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                Retrieved Passages ({displayChunks.length})
+              </span>
+            </div>
+
+            {displayChunks.length === 0 ? (
+              <p className="text-caption" style={{ fontStyle: 'italic' }}>No source chunks attached.</p>
+            ) : (
+              displayChunks.map((chunk, idx) => {
+                const isObj = typeof chunk === 'object' && chunk !== null;
+                const chunkId = isObj ? (chunk.chunk_id || `chunk_${idx}`) : chunk;
+                const docTitle = isObj ? (chunk.doc_title || chunk.book || 'Technical Reference') : 'Textbook Reference';
+                const section = isObj ? (chunk.section || 'Core Fundamentals') : 'Section Overview';
+                const text = isObj ? (chunk.text || chunk.excerpt || 'Context passage') : '';
+                const score = isObj && chunk.score ? (chunk.score * 100).toFixed(1) + '%' : null;
+
+                return (
+                  <div
+                    key={idx}
+                    style={{
+                      border: '1px solid var(--color-border)',
+                      borderRadius: '14px',
+                      padding: '16px 18px',
+                      backgroundColor: 'rgba(255, 255, 255, 0.75)'
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span className="tag-nude" style={{ fontSize: '11px', borderRadius: '6px' }}>
+                          {chunkId}
+                        </span>
+                        <span className="text-body-s" style={{ fontWeight: '600' }}>
+                          {docTitle}
+                        </span>
+                      </div>
+                      {score && (
+                        <span className="tag-ivory" style={{ fontSize: '11px', borderRadius: '6px' }}>
+                          SIM: {score}
+                        </span>
+                      )}
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '10px' }}>
+                      <Bookmark size={12} color="var(--color-text-secondary)" />
+                      <span className="text-micro-data" style={{ color: 'var(--color-text-secondary)' }}>
+                        {section}
+                      </span>
+                    </div>
+
+                    {text && (
+                      <div style={{
+                        backgroundColor: 'var(--color-ivory)',
+                        borderLeft: '2.5px solid var(--color-obsidian-100)',
+                        borderRadius: '0 8px 8px 0',
+                        padding: '12px 14px'
+                      }}>
+                        <p className="text-body" style={{ fontSize: '13px', lineHeight: '1.6', margin: 0 }}>
+                          {text}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Modal Footer */}
+        <div style={{
+          padding: '16px 24px',
+          borderTop: '1px solid var(--color-border)',
+          display: 'flex',
+          justifyContent: 'flex-end',
+          backgroundColor: 'rgba(243, 240, 233, 0.4)'
+        }}>
+          <button
+            onClick={onClose}
+            className="btn-liquid-glass"
+            style={{
+              padding: '8px 20px',
+              fontSize: '13px',
+              borderRadius: '10px'
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* --- END FILE: src\components\TraceabilityModal.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\hooks\useInterviewAgent.js --- */
+// File: frontend/src\hooks\useInterviewAgent.js
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import InterviewAgent from '../voice/interviewAgent';
+
+export function useInterviewAgent({
+  session,
+  candidateName,
+  role,
+  resumeText,
+  currentQuestion,
+  onSubmitAnswer,
+  onComplete,
+}) {
+  const agentRef = useRef(null);
+  const submitAnswerRef = useRef(onSubmitAnswer);
+  const onCompleteRef = useRef(onComplete);
+  submitAnswerRef.current = onSubmitAnswer;
+  onCompleteRef.current = onComplete;
+  const [, forceRender] = useState(0);
+  const [snapshot, setSnapshot] = useState({ state: 'IDLE', message: 'Ready' });
+  const [history, setHistory] = useState([]);
+  const [plan, setPlan] = useState(null);
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [volume, setVolume] = useState(0);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [hasStarted, setHasStarted] = useState(false);
+  const [, setCompleted] = useState(false);
+
+  if (!agentRef.current) {
+    agentRef.current = new InterviewAgent({
+      session,
+      candidateName,
+      role,
+      resumeText,
+      currentQuestion,
+      onSubmitAnswer: (...args) => submitAnswerRef.current?.(...args),
+      onComplete: () => {
+        setCompleted(true);
+        onCompleteRef.current?.();
+      },
+    });
+
+    agentRef.current.onChange = (next) => { setSnapshot({ ...next }); forceRender(v => v + 1); };
+    agentRef.current.onPlanChange = (next) => { setPlan(next); forceRender(v => v + 1); };
+    agentRef.current.onHistoryChange = (next) => setHistory(next);
+    agentRef.current.onVolume = (next) => setVolume(next);
+    agentRef.current.onLiveTranscript = (next) => setLiveTranscript(next);
+    agentRef.current.onError = (msg) => { setErrorMessage(msg || 'Voice input unavailable.'); forceRender(v => v + 1); };
+  }
+
+  useEffect(() => {
+    const agent = agentRef.current;
+    if (currentQuestion) agent.setCurrentQuestion(currentQuestion);
+  }, [currentQuestion]);
+
+  useEffect(() => {
+    const agent = agentRef.current;
+    return () => agent.destroy();
+  }, []);
+
+  const start = useCallback(async () => {
+    const agent = agentRef.current;
+    if (!agent || hasStarted) return;
+    setErrorMessage('');
+    try {
+      await agent.start();
+      setHasStarted(true);
+    } catch (err) {
+      setErrorMessage(err?.message || 'Failed to start interview.');
+    }
+  }, [hasStarted]);
+
+  const value = {
+    start,
+    toggleMic: () => agentRef.current?.toggleMic(),
+    interrupt: () => agentRef.current?.interrupt(),
+    togglePause: () => agentRef.current?.togglePause(),
+    forceEnd: () => agentRef.current?.forceEnd(),
+    submitText: (text) => agentRef.current?.submitText(text),
+    setCurrentQuestion: (question) => agentRef.current?.setCurrentQuestion(question),
+    state: snapshot.state,
+    snapshot,
+    history,
+    plan,
+    liveTranscript,
+    volume,
+    errorMessage,
+    hasStarted,
+    isSpeaking: snapshot.state === 'SPEAKING',
+    isListening: Boolean(agentRef.current?.isListening),
+    isProcessing: snapshot.state === 'PROCESSING',
+    isPlanning: snapshot.state === 'PLANNING_INTERVIEW',
+    isComplete: snapshot.state === 'COMPLETE',
+    isSupported: agentRef.current?.isSupported ?? false,
+  };
+
+  return value;
+}
+
+export default useInterviewAgent;
+
+
+/* --- END FILE: src\hooks\useInterviewAgent.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\index.css --- */
+// File: frontend/src\index.css
+
+:root {
+  /* Exactly 4-Value Achromatic-Warm System */
+  --color-off-white: #FDFCF8;
+  --color-ivory: #F3F0E9;
+  --color-nude: #E3DBCC;
+  --color-obsidian: #101010;
+
+  /* Opacity Derivations of Obsidian */
+  --color-obsidian-100: #101010;
+  --color-obsidian-70: rgba(16, 16, 16, 0.70);
+  --color-obsidian-55: rgba(16, 16, 16, 0.55);
+  --color-obsidian-15: rgba(16, 16, 16, 0.15);
+
+  /* Semantic Mappings */
+  --color-base: var(--color-off-white);
+  --color-surface-raised: var(--color-ivory);
+  --color-surface-nude: var(--color-nude);
+  --color-text: var(--color-obsidian-100);
+  --color-text-secondary: var(--color-obsidian-55);
+  --color-text-muted: rgba(16, 16, 16, 0.40);
+  --color-border: var(--color-obsidian-15);
+
+  /* Typography Families */
+  --font-sans: 'PP Neue Montreal', 'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-title: 'Felipa', 'Instrument Serif', Georgia, serif;
+  --font-wordmark: 'Felipa', 'Instrument Serif', Georgia, serif;
+  --font-mono: 'PP Supply Mono', 'Geist Mono', monospace;
+
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  font-weight: 400;
+  color: var(--color-text);
+  background-color: var(--color-base);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--color-base);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: left;
+}
+
+/* Typography Hierarchy Tokens (Data-As-Hero Scale) */
+.text-wordmark,
+.text-title {
+  font-family: var(--font-title);
+  font-size: 24px;
+  line-height: 1.1;
+  font-weight: 400;
+  color: var(--color-text);
+  letter-spacing: -0.01em;
+}
+
+/* Hero Score / Stat Token: 56px tabular nums, full Obsidian */
+.text-stat {
+  font-family: var(--font-sans);
+  font-size: 56px;
+  line-height: 1.0;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-obsidian-100);
+}
+
+.text-stat-label {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.3;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-text-secondary);
+}
+
+.text-display {
+  font-family: var(--font-sans);
+  font-size: 44px;
+  line-height: 1.1;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+}
+
+.text-h1 {
+  font-family: var(--font-sans);
+  font-size: 28px;
+  line-height: 1.15;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+}
+
+.text-h2 {
+  font-family: var(--font-sans);
+  font-size: 20px;
+  line-height: 1.25;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--color-text);
+}
+
+.text-h3 {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--color-text);
+}
+
+.text-body-l {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-text);
+  max-width: 68ch;
+}
+
+.text-body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-text);
+  max-width: 56ch;
+}
+
+.text-body-s {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-text);
+}
+
+.text-caption {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  color: var(--color-text-secondary);
+}
+
+.text-micro-data {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Layout Utilities (Asymmetric Panels, 20px radius, blur depth) */
+.layout-container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 24px;
+  text-align: left;
+}
+
+.panel-card-base {
+  background-color: var(--color-base);
+  border: 1px solid var(--color-border);
+  border-radius: 20px;
+  padding: 24px;
+  backdrop-filter: blur(16px);
+}
+
+.panel-card-ivory {
+  background-color: var(--color-ivory);
+  border: 1px solid var(--color-border);
+  border-radius: 20px;
+  padding: 24px;
+  backdrop-filter: blur(16px);
+}
+
+.panel-card-nude {
+  background-color: var(--color-nude);
+  border: 1px solid rgba(16, 16, 16, 0.08);
+  border-radius: 20px;
+  padding: 24px;
+  backdrop-filter: blur(16px);
+}
+
+.surface-ivory {
+  background-color: var(--color-ivory);
+  padding: 16px;
+  border-radius: 12px;
+}
+
+.surface-nude {
+  background-color: var(--color-nude);
+  padding: 16px;
+  border-radius: 12px;
+}
+
+.border-divider {
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* Floating Pill Dock Navigation */
+.floating-dock {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(243, 240, 233, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--color-border);
+  border-radius: 9999px;
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 100;
+}
+
+/* Liquid Glass Specular Button */
+.btn-liquid-glass {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 32px;
+  border-radius: 10px;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  color: #101010;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(243, 240, 233, 0.60) 45%,
+    rgba(255, 255, 255, 0.75) 100%
+  );
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 
+    0 12px 28px -4px rgba(16, 16, 16, 0.12),
+    0 4px 10px rgba(16, 16, 16, 0.04),
+    inset 0 1.5px 1px 0 rgba(255, 255, 255, 1),
+    inset 0 -1.5px 2px 0 rgba(16, 16, 16, 0.05),
+    inset 0 0 12px 0 rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 150ms ease-out, background 150ms ease-out;
+  text-decoration: none;
+  user-select: none;
+}
+
+.btn-liquid-glass::before {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 6%;
+  right: 6%;
+  height: 45%;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(255, 255, 255, 0.0) 100%
+  );
+  border-radius: 8px 8px 0 0;
+  pointer-events: none;
+}
+
+.btn-liquid-glass:hover:not(:disabled) {
+  transform: translateY(-1.5px);
+  box-shadow: 
+    0 16px 32px -4px rgba(16, 16, 16, 0.16),
+    0 6px 14px rgba(16, 16, 16, 0.06),
+    inset 0 1.5px 1px 0 rgba(255, 255, 255, 1),
+    inset 0 0 16px 0 rgba(255, 255, 255, 0.9);
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 1) 0%,
+    rgba(243, 240, 233, 0.75) 45%,
+    rgba(255, 255, 255, 0.9) 100%
+  );
+}
+
+.btn-liquid-glass:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: 
+    0 6px 14px -2px rgba(16, 16, 16, 0.10),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.8),
+    inset 0 2px 4px 0 rgba(16, 16, 16, 0.08);
+}
+
+.btn-liquid-glass:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+/* Interactive Elements (Radius 10px) */
+.btn-primary {
+  background-color: var(--color-obsidian-100);
+  color: var(--color-off-white);
+  border: 1px solid var(--color-obsidian-100);
+  border-radius: 10px;
+  padding: 10px 18px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 130ms ease-out, transform 130ms ease-out;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-decoration: none;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: #2b2b2b;
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn-primary:disabled {
+  background-color: var(--color-nude);
+  color: var(--color-text-muted);
+  border-color: var(--color-border);
+  cursor: not-allowed;
+}
+
+.btn-subtle {
+  background-color: var(--color-ivory);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 400;
+  cursor: pointer;
+  transition: background-color 130ms ease-out, border-color 130ms ease-out;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-subtle:hover:not(:disabled) {
+  background-color: var(--color-nude);
+  border-color: var(--color-obsidian-70);
+}
+
+.btn-subtle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 6px 12px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 400;
+  cursor: pointer;
+  transition: background-color 130ms ease-out;
+}
+
+.btn-ghost:hover {
+  background-color: var(--color-ivory);
+}
+
+/* Inputs & Form Controls (10px radius) */
+.input-control {
+  width: 100%;
+  background-color: var(--color-off-white);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--color-text);
+  transition: border-color 130ms ease-out;
+}
+
+.input-control:focus {
+  outline: none;
+  border-color: var(--color-obsidian-100);
+}
+
+.input-control::placeholder {
+  color: var(--color-text-muted);
+}
+
+/* Functional Metadata Badges (10px radius) */
+.tag-nude {
+  background-color: var(--color-nude);
+  color: var(--color-obsidian-100);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  padding: 4px 8px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid rgba(16, 16, 16, 0.08);
+}
+
+.tag-ivory {
+  background-color: var(--color-ivory);
+  color: var(--color-obsidian-100);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  padding: 4px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--color-border);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hide Scrollbars completely across all browsers */
+html, body, * {
+  scrollbar-width: none !important; /* Firefox */
+  -ms-overflow-style: none !important; /* IE / Edge */
+}
+
+::-webkit-scrollbar {
+  display: none !important; /* Chrome, Safari, Opera */
+  width: 0px !important;
+  height: 0px !important;
+  background: transparent !important;
+}
+
+
+
+/* --- END FILE: src\index.css --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\main.jsx --- */
+// File: frontend/src\main.jsx
+
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
+
+
+/* --- END FILE: src\main.jsx --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\voice\interviewAgent.js --- */
+// File: frontend/src\voice\interviewAgent.js
+
+// frontend/src/voice/interviewAgent.js
+// Production-grade 12-state interview agent architecture for technical screening.
+// Pure JS class — no React dependencies. Wired to React via useInterviewAgent.js
+
+import { speakText, stopAudio } from './speaker';
+import { VoiceListener } from './listener';
+
+// ─── State Definitions ────────────────────────────────────────────────────────
+
+export const S = {
+  IDLE:                'IDLE',
+  PLANNING_INTERVIEW:  'PLANNING_INTERVIEW',
+  SPEAKING:            'SPEAKING',
+  AWAITING_RESPONSE:   'AWAITING_RESPONSE',
+  INTERRUPTED:         'INTERRUPTED',
+  PROCESSING:          'PROCESSING',
+  CLARIFYING:          'CLARIFYING',
+  RECOVERING:          'RECOVERING',
+  WRAPPING_UP:         'WRAPPING_UP',
+  COMPLETE:            'COMPLETE',
+  ERROR:               'ERROR',
+  PAUSED:              'PAUSED',
+};
+
+const TRANSITIONS = {
+  [S.IDLE]:               [S.PROCESSING, S.PLANNING_INTERVIEW, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PLANNING_INTERVIEW]: [S.SPEAKING, S.WRAPPING_UP, S.ERROR, S.IDLE],
+  [S.SPEAKING]:           [S.PROCESSING, S.AWAITING_RESPONSE, S.INTERRUPTED, S.WRAPPING_UP, S.ERROR, S.PAUSED, S.IDLE],
+  [S.AWAITING_RESPONSE]:  [S.PROCESSING, S.CLARIFYING, S.SPEAKING, S.WRAPPING_UP, S.PAUSED, S.ERROR, S.IDLE],
+  [S.INTERRUPTED]:        [S.PROCESSING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PROCESSING]:         [S.SPEAKING, S.WRAPPING_UP, S.RECOVERING, S.ERROR, S.AWAITING_RESPONSE],
+  [S.CLARIFYING]:         [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.RECOVERING]:         [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.WRAPPING_UP]:        [S.COMPLETE, S.SPEAKING],
+  [S.COMPLETE]:           [S.IDLE],
+  [S.ERROR]:              [S.PROCESSING, S.RECOVERING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+  [S.PAUSED]:             [S.PROCESSING, S.SPEAKING, S.AWAITING_RESPONSE, S.WRAPPING_UP, S.IDLE],
+};
+
+const RESPONSE_TIMEOUT_MS = 90_000; // 90s — candidate given generous time
+const MAX_LOG = 30;
+const MAX_LISTENER_RESTARTS = 5;
+const SILENCE_TIMEOUT_MS = 2800;
+const POST_TTS_GUARD_MS = 300; // Delay before opening mic to prevent acoustic echo feedback
+
+// ─── State Machine ────────────────────────────────────────────────────────────
+
+class StateMachine {
+  constructor() {
+    this._current = { state: S.IDLE, message: 'Ready', timestamp: Date.now() };
+    this._log = [];
+    this._waitTimer = null;
+
+    // Hooks
+    this.onChange = null;      // (snapshot) => void
+    this.onExitBusy = null;    // () => void — called when leaving SPEAKING/PROCESSING
+    this.onWaitTimeout = null; // () => void — called when AWAITING_RESPONSE times out
+  }
+
+  get state() { return this._current.state; }
+  get current() { return this._current; }
+  get log() { return this._log; }
+
+  transition(to, message = '', extra = {}) {
+    const from = this._current.state;
+
+    // Self-transition: just update message, no hooks
+    if (from === to && to !== S.IDLE) {
+      if (message) {
+        this._current = { ...this._current, message, timestamp: Date.now(), ...extra };
+        this.onChange?.(this._current);
+      }
+      return this._current;
+    }
+
+    const allowed = TRANSITIONS[from] || [];
+    if (!allowed.includes(to)) {
+      console.warn(`[InterviewAgent FSM] Invalid transition: ${from} → ${to}. Allowed: [${allowed.join(', ')}]`);
+      return null;
+    }
+
+    // Exit-busy hook: leaving SPEAKING or PROCESSING
+    if ((from === S.SPEAKING || from === S.PROCESSING) && to !== S.SPEAKING && to !== S.PROCESSING) {
+      this.onExitBusy?.();
+    }
+
+    // Clear response timeout when leaving AWAITING_RESPONSE
+    if (from === S.AWAITING_RESPONSE) {
+      this._clearWaitTimer();
+    }
+
+    this._log.push({ from, to, message, timestamp: Date.now() });
+    if (this._log.length > MAX_LOG) this._log.shift();
+
+    this._current = { state: to, message: message || to, timestamp: Date.now(), ...extra };
+    this.onChange?.(this._current);
+
+    // Start response timeout on AWAITING_RESPONSE
+    if (to === S.AWAITING_RESPONSE) {
+      this._startWaitTimer();
+    }
+
+    return this._current;
+  }
+
+  reset(message = 'Reset') {
+    this._clearWaitTimer();
+    this._current = { state: S.IDLE, message, timestamp: Date.now() };
+    this.onChange?.(this._current);
+  }
+
+  _startWaitTimer() {
+    this._clearWaitTimer();
+    this._waitTimer = setTimeout(() => {
+      if (this.state === S.AWAITING_RESPONSE) {
+        this.onWaitTimeout?.();
+      }
+    }, RESPONSE_TIMEOUT_MS);
+  }
+
+  _clearWaitTimer() {
+    if (this._waitTimer) {
+      clearTimeout(this._waitTimer);
+      this._waitTimer = null;
+    }
+  }
+}
+
+// ─── Plan Synthesizer ─────────────────────────────────────────────────────────
+
+export function synthesizeInterviewPlan(session, candidateName, role, resumeText = '') {
+  const name = candidateName || session?.candidate_name || 'there';
+  const topics = session?.topics_planned || [];
+
+  // Build todos from planned topics
+  const todos = topics.map((t, i) => {
+    const areaName = typeof t === 'string' ? t : (t.topic || `Topic ${i + 1}`);
+    const reasoning = typeof t === 'object' && t.reasoning ? t.reasoning : `Assess candidate depth in ${areaName}`;
+    return {
+      id: `t${i}`,
+      area: areaName,
+      intent: reasoning,
+      status: 'pending',      // 'pending' | 'covered' | 'skipped'
+      priority: i < 2 ? 'high' : 'medium',
+      attempts: 0,
+    };
+  });
+
+  const resumeSnippet = resumeText ? ` I've reviewed your background.` : '';
+
+  return {
+    candidateName: name,
+    role,
+    greeting: `Hi ${name}, welcome to your ${role} screening interview.${resumeSnippet} We'll have a technical discussion covering your background and core engineering principles. Ready to begin?`,
+    todos,
+    closing: `Thank you so much for your time today, ${name}. That concludes our screening session. We are compiling your performance evaluation now.`,
+    resumeContext: resumeText.slice(0, 800),
+  };
+}
+
+// ─── Main Agent Class ─────────────────────────────────────────────────────────
+
+export class InterviewAgent {
+  constructor({ session, candidateName, role, resumeText, currentQuestion, onSubmitAnswer, onComplete }) {
+    this.machine = new StateMachine();
+    this.session = session;
+    this.candidateName = candidateName;
+    this.role = role;
+    this.resumeText = resumeText;
+    this.currentQuestion = currentQuestion || null;
+    this._onSubmitAnswer = onSubmitAnswer;   // (questionId, answerText) => Promise<result>
+    this._onComplete = onComplete;           // () => void
+
+    this.plan = null;
+    this.conversationHistory = [];  // [{ role: 'interviewer'|'candidate', text, timestamp }]
+    this.abortController = null;
+    this.listenerRestarts = 0;
+    this.isSubmitting = false;
+    this._destroyed = false;
+    this._submissionToken = 0;
+
+    // Listener instance (single, reused)
+    this.listener = new VoiceListener({ autoVAD: false, continuous: false, interimResults: true });
+    this._wireListener();
+
+    // Machine hooks
+    this.machine.onExitBusy = () => {
+      stopAudio();
+    };
+
+    this.machine.onWaitTimeout = async () => {
+      // Candidate silent for 90s — gentle prompt
+      await this._speakAndTransition(
+        'Just checking in — take your time. Would you like me to clarify the question, or would you like to continue?',
+        S.AWAITING_RESPONSE,
+        'Still listening...'
+      );
+    };
+
+    // Public callbacks (wired by hook)
+    this.onChange = null;        // (snapshot) => void
+    this.onPlanChange = null;    // (plan) => void
+    this.onHistoryChange = null; // (history) => void
+    this.onVolume = null;        // (level: 0-1) => void
+    this.onLiveTranscript = null; // (text) => void
+    this.onError = null;         // (msg) => void
+  }
+
+  // ── Public API ──────────────────────────────────────────────────────────────
+
+  get state() { return this.machine.state; }
+  get snapshot() { return this.machine.current; }
+  get isSupported() { return VoiceListener.isSupported(); }
+  get isListening() { return Boolean(this.listener?.isRecording); }
+
+  /** Kick off the interview. Call once after mount. */
+  async start() {
+    if (this.machine.state !== S.IDLE) return;
+    this.machine.onChange = (snap) => this.onChange?.(snap);
+
+    this.machine.transition(S.PLANNING_INTERVIEW, 'Preparing your interview...');
+
+    try {
+      this.plan = synthesizeInterviewPlan(this.session, this.candidateName, this.role, this.resumeText);
+      this.onPlanChange?.(this.plan);
+    } catch (err) {
+      console.error('[InterviewAgent] Plan synthesis failed:', err);
+      this.plan = {
+        candidateName: this.candidateName || 'there',
+        role: this.role,
+        greeting: `Hi, welcome to your ${this.role} interview. Let's get started.`,
+        todos: (this.session?.topics_planned || []).map((t, i) => ({
+          id: `t${i}`, area: t.topic || t, intent: '', status: 'pending', priority: 'medium', attempts: 0,
+        })),
+        closing: 'Thank you for your time today. We will be in touch.',
+        resumeContext: '',
+      };
+      this.onPlanChange?.(this.plan);
+    }
+
+    const firstQText = this.currentQuestion?.question_text || this.currentQuestion?.question;
+    if (firstQText) {
+      await this._addToHistory('interviewer', firstQText);
+      this.machine.transition(S.SPEAKING, 'Asking first question...');
+      await this._safeSpeak(firstQText);
+    } else {
+      await this._addToHistory('interviewer', this.plan.greeting);
+      this.machine.transition(S.SPEAKING, 'Greeting candidate...');
+      await this._safeSpeak(this.plan.greeting);
+    }
+
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  /** Handle a completed user utterance (from VAD or manual submit). */
+  async handleUserInput(text) {
+    const trimmed = text?.trim();
+    if (!trimmed) return;
+    if (this.isSubmitting || this._destroyed || this.machine.state === S.COMPLETE || this.machine.state === S.WRAPPING_UP) return;
+    this.isSubmitting = true;
+    const submissionToken = ++this._submissionToken;
+
+    // Immediately stop any TTS audio playing right now
+    stopAudio();
+
+    // Pure server-driven turn processing: AI Turn Director determines stay, advance, or conclude
+    await this._processUserAnswer(trimmed);
+  }
+
+  async submitText(text) {
+    await this.handleUserInput(text);
+  }
+
+  /** Manual mic toggle from UI button. Mic only listens when candidate explicitly activates it. */
+  async toggleMic() {
+    if (this.isListening) {
+      // Button release ends the recording. Await backend STT before submitting.
+      const captured = await this._stopListening();
+      if (captured?.trim()) {
+        await this.handleUserInput(captured.trim());
+      } else {
+        this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+      }
+      return;
+    }
+
+    // Button press starts push-to-talk. If TTS is active, this is a manual interrupt.
+    stopAudio();
+    await this._stopListening();
+    await this._startListening();
+  }
+
+  /** Interrupt the speaking agent (user tapped orb or pressed key). */
+  async interrupt() {
+    stopAudio();
+    this._stopListening();
+    this.machine.transition(S.AWAITING_RESPONSE, 'Listening to your response...');
+    await this._startListening();
+  }
+
+  /** Manual pause/resume toggle. */
+  async togglePause() {
+    if (this.machine.state === S.PAUSED) {
+      await this._resumeFromPause();
+    } else {
+      stopAudio();
+      this._stopListening();
+      this.machine.transition(S.PAUSED, 'Interview paused');
+    }
+  }
+
+  /** Called by App when a new question arrives from backend. */
+  setCurrentQuestion(question) {
+    this.currentQuestion = question;
+  }
+
+  /** Force-end the interview immediately — used by UI button and "end interview" intent. */
+  async forceEnd() {
+    const st = this.machine.state;
+    if (st === S.COMPLETE || st === S.WRAPPING_UP) return;
+    stopAudio();
+    this._stopListening();
+    this.abortController?.abort();
+    ++this._submissionToken;
+    this.isSubmitting = false;
+    await this._wrapUp();
+  }
+
+  /** Tear down cleanly — call on unmount. */
+  destroy() {
+    stopAudio();
+    this._stopListening();
+    this._destroyed = true;
+    ++this._submissionToken;
+    this.machine.reset('Agent destroyed');
+    this.abortController?.abort();
+  }
+
+  // ── Internal ─────────────────────────────────────────────────────────────────
+
+  _wireListener() {
+    this.listener.onVolume = (vol) => this.onVolume?.(vol);
+    this.listener.onInterim = (text) => this.onLiveTranscript?.(text);
+    this.listener.onFinal = (text) => this.onLiveTranscript?.(text);
+
+    this.listener.onSilence = async (fullText) => {
+      if (
+        this.machine.state === S.AWAITING_RESPONSE ||
+        this.machine.state === S.CLARIFYING ||
+        this.machine.state === S.INTERRUPTED
+      ) {
+        await this.handleUserInput(fullText);
+      }
+    };
+
+    this.listener.onError = (err) => {
+      const code = err?.error || err?.message || String(err);
+      if (code === 'not-allowed') {
+        this.machine.transition(S.ERROR, 'Microphone permission denied.');
+        this.onError?.('Microphone access denied. You can still type your answers below.');
+      } else if (code === 'Web Speech API is not supported in this browser.' || code?.includes?.('not supported')) {
+        this.onError?.('Voice unavailable in this browser. Use text input below.');
+      } else if (code !== 'no-speech') {
+        console.warn('[InterviewAgent] Listener error:', code);
+        this._handleListenerRestart();
+      }
+    };
+
+    this.listener.onEnd = () => {
+      this.onVolume?.(0);
+      // Push-to-talk: stopping is intentional. Never auto-restart the mic.
+    };
+  }
+
+  async _handleListenerRestart() {
+    // Retained for compatibility with older callers. Push-to-talk never auto-restarts.
+  }
+
+  async _finishSpeaking() {
+    // Safety delay to ensure TTS audio has finished rendering
+    await new Promise(r => setTimeout(r, POST_TTS_GUARD_MS));
+    if (this.machine.state === S.SPEAKING || this.machine.state === S.CLARIFYING || this.machine.state === S.RECOVERING) {
+      this._stopListening();
+      this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+    }
+  }
+
+  async _startListening() {
+    this.listenerRestarts = 0;
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+    this.machine.transition(S.AWAITING_RESPONSE, 'Listening to your response...');
+    try {
+      await this.listener.start();
+    } catch (err) {
+      const isPermission = err?.message?.includes('Permission') || err?.name === 'NotAllowedError';
+      if (isPermission) {
+        this.machine.transition(S.ERROR, 'Microphone permission denied.');
+        this.onError?.('Microphone access denied. You can still type your answers below.');
+      } else {
+        this.onError?.('Voice unavailable. Text input is active.');
+      }
+    }
+  }
+
+  async _stopListening() {
+    try { return await this.listener.stop(); } catch (_) { return ''; }
+    finally { this.onVolume?.(0); }
+  }
+
+  async _handleInterruption(text) {
+    stopAudio();
+    this._stopListening();
+    this.machine.transition(S.INTERRUPTED, 'Interrupted. Listening...');
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+
+    if (text) {
+      await this._processUserAnswer(text);
+    } else {
+      await this._startListening();
+    }
+  }
+
+  async _resumeFromPause() {
+    this.machine.transition(S.AWAITING_RESPONSE, 'Ready for your answer (Type or tap Voice)...');
+    this.listener.resetTranscript();
+    this.onLiveTranscript?.('');
+    this._stopListening();
+  }
+
+  /** Core: take user's answer, evaluate, advance plan. */
+  async _processUserAnswer(text) {
+    this._stopListening();
+    this.onLiveTranscript?.('');
+    await this._addToHistory('candidate', text);
+
+    const transitioned = this.machine.transition(S.PROCESSING, 'Evaluating your response...');
+    if (!transitioned) {
+      console.warn('[InterviewAgent] _processUserAnswer called from invalid state:', this.machine.state);
+      this.isSubmitting = false;
+      return;
+    }
+
+    this.abortController?.abort();
+    const ac = new AbortController();
+    this.abortController = ac;
+
+    try {
+      const result = await this._onSubmitAnswer(
+        this.currentQuestion?.id,
+        text,
+        ac.signal
+      );
+
+      if (ac.signal.aborted || submissionToken !== this._submissionToken || this._destroyed) return;
+
+      if (result?.action === 'stay') {
+        const reply = result.interviewer_reply || "Whenever you're ready, let me know your thoughts on this topic.";
+        await this._addToHistory('interviewer', reply);
+        this.machine.transition(S.SPEAKING, 'Interviewer replying...');
+        await this._safeSpeak(reply);
+        if (this.machine.state === S.SPEAKING) {
+          await this._finishSpeaking();
+        }
+        return;
+      }
+
+      if (result?.action === 'conclude' || result?.is_session_completed) {
+        await this._wrapUp();
+        return;
+      }
+
+      this._syncTopicCoverage(result?.progress?.topic_coverage, this.currentQuestion?.topic);
+
+      if (result?.next_question) {
+        this.currentQuestion = result.next_question;
+        await this._speakNextQuestion(result);
+      } else {
+        await this._safeRecover('Got an unexpected response from the server. Let me continue.');
+      }
+    } catch (err) {
+      if (ac.signal.aborted) return;
+      console.error('[InterviewAgent] Submit answer failed:', err);
+      this.machine.transition(S.RECOVERING, 'Network error. Retrying...');
+      await this._safeSpeak('I had a connection issue. Let me repeat the question.');
+      await this._repeatCurrentQuestion();
+    } finally {
+      this.isSubmitting = false;
+    }
+  }
+
+  async _speakNextQuestion(result) {
+    const nextQ = result.next_question;
+    const questionText = nextQ.question_text || nextQ.question || '';
+
+    await this._addToHistory('interviewer', questionText);
+    this.machine.transition(S.SPEAKING, 'Asking next question...');
+    await this._safeSpeak(questionText);
+
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _speakQuestion(question) {
+    if (!question) return;
+    const text = question.question_text || question.question || '';
+    await this._addToHistory('interviewer', text);
+    this.machine.transition(S.SPEAKING, 'Asking question...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _repeatCurrentQuestion() {
+    if (!this.currentQuestion) return;
+    const text = this.currentQuestion.question_text || this.currentQuestion.question || '';
+    this.machine.transition(S.SPEAKING, 'Repeating the question...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      await this._finishSpeaking();
+    }
+  }
+
+  async _wrapUp() {
+    this.machine.transition(S.WRAPPING_UP, 'Wrapping up interview...');
+    const closingText = this.plan?.closing || `Thank you so much for your time today, ${this.candidateName || 'there'}. That wraps up our screening. We are synthesizing your detailed evaluation report.`;
+    await this._addToHistory('interviewer', closingText);
+    await this._safeSpeak(closingText);
+    this.machine.transition(S.COMPLETE, 'Interview complete');
+    setTimeout(() => {
+      this._onComplete?.();
+    }, 800);
+  }
+
+  async _safeSpeak(text) {
+    try {
+      await speakText(text);
+    } catch (err) {
+      console.warn('[InterviewAgent] TTS failed:', err);
+    }
+  }
+
+  async _speakAndTransition(text, toState, message) {
+    this.machine.transition(S.SPEAKING, 'Speaking...');
+    await this._safeSpeak(text);
+    if (this.machine.state === S.SPEAKING) {
+      this.machine.transition(toState, message);
+    }
+  }
+
+  async _safeRecover(message) {
+    this.machine.transition(S.RECOVERING, message);
+    await this._safeSpeak(message);
+    await this._finishSpeaking();
+  }
+
+  async _addToHistory(role, text) {
+    const entry = { role, text, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
+    this.conversationHistory.push(entry);
+    this.onHistoryChange?.([...this.conversationHistory]);
+  }
+
+  _syncTopicCoverage(topicCoverage, fallbackTopic) {
+    if (!this.plan || !this.plan.todos) return;
+
+    if (topicCoverage && Object.keys(topicCoverage).length > 0) {
+      for (const todo of this.plan.todos) {
+        const areaNorm = todo.area.toLowerCase().trim();
+        const matchedKey = Object.keys(topicCoverage).find(
+          k => k.toLowerCase().trim() === areaNorm ||
+               k.toLowerCase().trim().includes(areaNorm) ||
+               areaNorm.includes(k.toLowerCase().trim())
+        );
+        if (matchedKey) {
+          const entry = topicCoverage[matchedKey];
+          if (entry.covered) {
+            todo.status = 'covered';
+          } else if (entry.attempts >= 2) {
+            todo.status = 'reviewed';
+          } else if (entry.attempts > 0) {
+            todo.status = 'probing';
+          }
+          todo.attempts = entry.attempts || 0;
+        }
+      }
+      this.onPlanChange?.({ ...this.plan, todos: [...this.plan.todos] });
+      return;
+    }
+
+    this._markTodoCovered(fallbackTopic);
+  }
+
+  _markTodoCovered(topic) {
+    if (!this.plan || !this.plan.todos) return;
+    const cleanTopic = String(topic || '').toLowerCase().trim();
+    
+    // First, attempt to match the pending todo by topic name
+    let todo = this.plan.todos.find(
+      t => t.status === 'pending' && cleanTopic && (
+        cleanTopic.includes(t.area.toLowerCase().trim()) ||
+        t.area.toLowerCase().trim().includes(cleanTopic)
+      )
+    );
+
+    // Fallback: match the first pending todo
+    if (!todo) {
+      todo = this.plan.todos.find(t => t.status === 'pending');
+    }
+
+    if (todo) {
+      todo.status = 'covered';
+      todo.attempts = (todo.attempts || 0) + 1;
+      this.onPlanChange?.({ ...this.plan, todos: [...this.plan.todos] });
+    }
+  }
+}
+
+export default InterviewAgent;
+
+
+/* --- END FILE: src\voice\interviewAgent.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\voice\listener.js --- */
+// File: frontend/src\voice\listener.js
+
+// frontend/src/voice/listener.js
+// Push-to-talk recorder. The button is the endpoint; no autonomous VAD is used.
+import { transcribeAudio } from '../api';
+
+export class VoiceListener {
+  constructor(options = {}) {
+    this.options = {
+      lang: 'en-US',
+      continuous: false,
+      interimResults: true,
+      autoVAD: false,
+      ...options,
+    };
+
+    this.recognition = null;
+    this.mediaStream = null;
+    this.mediaRecorder = null;
+    this.audioChunks = [];
+    this.audioContext = null;
+    this.analyser = null;
+    this.animationFrameId = null;
+
+    this.isRecording = false;
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.hasSpoken = false;
+    this._stopPromise = null;
+    this._recordingMimeType = 'audio/webm';
+
+    this.onInterim = null;
+    this.onFinal = null;
+    this.onVolume = null;
+    this.onSilence = null; // retained for compatibility; never fired in PTT mode
+    this.onError = null;
+    this.onStart = null;
+    this.onEnd = null;
+  }
+
+  static isSupported() {
+    return typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia);
+  }
+
+  async start() {
+    if (this.isRecording) return;
+
+    this._cleanupAudioAnalyser();
+    this._stopPreviewRecognition();
+    this.resetTranscript();
+
+    if (!VoiceListener.isSupported() || typeof MediaRecorder === 'undefined') {
+      const err = new Error('Voice recording is not supported in this browser.');
+      this.onError?.(err);
+      throw err;
+    }
+
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+      ];
+      const mimeType = candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+      this._recordingMimeType = mimeType || 'audio/webm';
+      this.mediaRecorder = mimeType
+        ? new MediaRecorder(this.mediaStream, { mimeType })
+        : new MediaRecorder(this.mediaStream);
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data?.size) this.audioChunks.push(event.data);
+      };
+
+      this.mediaRecorder.onerror = (event) => {
+        this.onError?.(event?.error || new Error('Audio recording failed.'));
+      };
+
+      this.mediaRecorder.start(250);
+      this.isRecording = true;
+      this.onStart?.();
+
+      await this._startAudioAnalyser();
+      this._startPreviewRecognition();
+
+      console.log('[STT] Push-to-talk recording active.');
+    } catch (err) {
+      this._cleanupAudioAnalyser();
+      this.isRecording = false;
+      this.onError?.(err);
+      throw err;
+    }
+  }
+
+  async stop() {
+    if (this._stopPromise) return this._stopPromise;
+    if (!this.isRecording) return (this.finalTranscript || '').trim();
+
+    this._stopPromise = this._stopInternal();
+    try {
+      return await this._stopPromise;
+    } finally {
+      this._stopPromise = null;
+    }
+  }
+
+  async _stopInternal() {
+    this.isRecording = false;
+    this._stopPreviewRecognition();
+
+    const recorder = this.mediaRecorder;
+    const mimeType = recorder?.mimeType || this._recordingMimeType || 'audio/webm';
+
+    if (recorder && recorder.state !== 'inactive') {
+      await new Promise((resolve) => {
+        const previousOnStop = recorder.onstop;
+        recorder.onstop = (event) => {
+          try { previousOnStop?.(event); } catch (_) {}
+          resolve();
+        };
+        try {
+          recorder.stop();
+        } catch (_) {
+          resolve();
+        }
+      });
+    }
+
+    let resultText = (this.finalTranscript || '').trim();
+    const audioBlob = this.audioChunks.length
+      ? new Blob(this.audioChunks, { type: mimeType })
+      : null;
+
+    if (audioBlob && audioBlob.size > 1500) {
+      try {
+        const sttData = await transcribeAudio(audioBlob, this.options.lang?.split('-')[0] || 'en');
+        if (sttData?.text?.trim()) {
+          resultText = sttData.text.trim();
+        }
+      } catch (err) {
+        console.warn('[STT] Backend transcription failed; using browser preview transcript:', err);
+      }
+    }
+
+    this.mediaRecorder = null;
+    this.audioChunks = [];
+    this._cleanupAudioAnalyser();
+    this.onEnd?.();
+
+    this.finalTranscript = resultText;
+    this.interimTranscript = '';
+    if (resultText) this.onFinal?.(resultText);
+    return resultText;
+  }
+
+  resetTranscript() {
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.audioChunks = [];
+    this.hasSpoken = false;
+  }
+
+  _startPreviewRecognition() {
+    const SpeechRec = typeof window !== 'undefined'
+      ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+      : null;
+    if (!SpeechRec) return;
+
+    try {
+      const recognition = new SpeechRec();
+      recognition.continuous = this.options.continuous;
+      recognition.interimResults = this.options.interimResults;
+      recognition.lang = this.options.lang;
+
+      recognition.onresult = (event) => {
+        let finalStr = '';
+        let interimStr = '';
+        for (let i = 0; i < event.results.length; i += 1) {
+          const item = event.results[i];
+          const text = item?.[0]?.transcript || '';
+          if (item.isFinal) finalStr += `${text} `;
+          else interimStr += text;
+        }
+
+        this.finalTranscript = finalStr.trim();
+        this.interimTranscript = interimStr.trim();
+        const combined = `${this.finalTranscript} ${this.interimTranscript}`.trim();
+        this.hasSpoken = Boolean(combined);
+        if (combined) this.onInterim?.(combined);
+      };
+
+      recognition.onerror = (event) => {
+        if (event?.error !== 'no-speech') {
+          console.warn('[STT] Browser preview recognition:', event?.error || 'unknown error');
+        }
+      };
+
+      recognition.onend = () => {
+        // Browser preview is intentionally best-effort. Never restart automatically.
+      };
+
+      recognition.start();
+      this.recognition = recognition;
+    } catch (err) {
+      console.warn('[STT] Browser preview unavailable; MediaRecorder remains authoritative.', err);
+    }
+  }
+
+  _stopPreviewRecognition() {
+    if (!this.recognition) return;
+    try { this.recognition.stop(); } catch (_) {}
+    this.recognition = null;
+  }
+
+  async _startAudioAnalyser() {
+    try {
+      if (!this.mediaStream || typeof window === 'undefined') return;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+
+      this.audioContext = new AudioCtx();
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 256;
+      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+      source.connect(this.analyser);
+
+      const data = new Uint8Array(this.analyser.frequencyBinCount);
+      const tick = () => {
+        if (!this.isRecording || !this.analyser) return;
+        this.analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i += 1) sum += data[i];
+        const volume = Math.min(1, (sum / Math.max(1, data.length)) / 128);
+        if (volume > 0.05) this.hasSpoken = true;
+        this.onVolume?.(volume);
+        this.animationFrameId = requestAnimationFrame(tick);
+      };
+      this.animationFrameId = requestAnimationFrame(tick);
+    } catch (err) {
+      console.warn('[STT] Audio analyser unavailable:', err);
+    }
+  }
+
+  _cleanupAudioAnalyser() {
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+    if (this.mediaStream) {
+      for (const track of this.mediaStream.getTracks()) track.stop();
+      this.mediaStream = null;
+    }
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      this.audioContext.close().catch(() => {});
+    }
+    this.audioContext = null;
+    this.analyser = null;
+    this.onVolume?.(0);
+  }
+}
+
+
+/* --- END FILE: src\voice\listener.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\voice\speaker.js --- */
+// File: frontend/src\voice\speaker.js
+
+// frontend/src/voice/speaker.js
+// High-fidelity Google Cloud TTS player powered by Web Audio API.
+import { synthesizeSpeech } from '../api';
+
+let audioQueue = []; // { run, resolve }
+let isPlaying = false;
+let globalAudioCtx = null;
+let currentSourceNode = null;
+let currentAudioElement = null;
+let currentUtterance = null;
+let currentRunResolve = null;
+let playbackGeneration = 0;
+const activeUtterances = new Set();
+
+function getAudioContext() {
+  if (typeof window === 'undefined') return null;
+  if (!globalAudioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      globalAudioCtx = new AudioCtx();
+    }
+  }
+  if (globalAudioCtx && globalAudioCtx.state === 'suspended') {
+    globalAudioCtx.resume().catch(() => {});
+  }
+  return globalAudioCtx;
+}
+
+function sanitizeTextForSpeech(text) {
+  if (!text) return '';
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '$1')       // bold
+    .replace(/\*(.*?)\*/g, '$1')           // italic
+    .replace(/`{1,3}[^`]*`{1,3}/g, '')     // code blocks
+    .replace(/#+\s*/g, '')                 // headings
+    .replace(/\[(.*?)\]\(.*?\)/g, '$1')    // links
+    .replace(/[-*]\s+/g, '')               // list bullets
+    .replace(/\s+/g, ' ')                  // normalize whitespace
+    .trim();
+}
+
+/**
+ * Synthesizes and plays speech using Google Cloud TTS backend endpoint via Web Audio API.
+ */
+async function cloudTTS(text, { onStart, onEnd, generation } = {}) {
+  const cleanText = sanitizeTextForSpeech(text);
+  if (!cleanText) return;
+
+  const startTime = Date.now();
+  console.log(`%c[TTS][Google Cloud] Synthesizing speech: "${cleanText.slice(0, 70)}..."`, 'color: #8b5cf6; font-weight: bold;');
+
+  try {
+    const audioBlob = await synthesizeSpeech(cleanText);
+    if (generation !== playbackGeneration) return;
+    const audioCtx = getAudioContext();
+
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      return new Promise((resolve) => {
+        currentRunResolve = resolve;
+        if (generation !== playbackGeneration) { currentRunResolve = null; resolve(); return; }
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        currentSourceNode = source;
+
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #10b981;');
+          if (currentSourceNode === source) {
+            currentSourceNode = null;
+          }
+          onEnd?.();
+          if (currentRunResolve === resolve) currentRunResolve = null;
+          resolve();
+        };
+
+        source.onended = finish;
+
+        console.log(`%c[TTS][Google Cloud] Playing audio stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+        onStart?.();
+        source.start(0);
+      });
+    } else {
+      // HTML5 Audio fallback if AudioContext is unsupported
+      const audioUrl = URL.createObjectURL(audioBlob);
+      if (generation !== playbackGeneration) { URL.revokeObjectURL(audioUrl); return; }
+      const audio = new Audio(audioUrl);
+      currentAudioElement = audio;
+
+      return new Promise((resolve) => {
+        currentRunResolve = resolve;
+        audio.onplay = () => {
+          console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+          onStart?.();
+        };
+
+        const finish = () => {
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #a78bfa;');
+          URL.revokeObjectURL(audioUrl);
+          if (currentAudioElement === audio) {
+            currentAudioElement = null;
+          }
+          onEnd?.();
+          if (currentRunResolve === resolve) currentRunResolve = null;
+          resolve();
+        };
+
+        audio.onended = finish;
+        audio.onerror = (e) => {
+          console.warn('[TTS][Google Cloud] Audio playback error:', e);
+          finish();
+        };
+
+        audio.play().catch((err) => {
+          console.warn('[TTS][Google Cloud] Audio play() prevented:', err);
+          finish();
+        });
+      });
+    }
+  } catch (err) {
+    console.error('[TTS][Google Cloud] Synthesis error:', err);
+    onEnd?.();
+  }
+}
+
+function getPreferredVoice() {
+  if (typeof window === 'undefined' || !window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || voices.length === 0) return null;
+
+  return (
+    voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Ava') || v.name.includes('Jenny'))) ||
+    voices.find(v => v.lang.startsWith('en') && (v.name.includes('Zira') || v.name.includes('David') || v.name.includes('Daniel'))) ||
+    voices.find(v => v.lang.startsWith('en')) ||
+    voices[0]
+  );
+}
+
+function browserTTS(text, { onStart, onEnd, rate = 1.0, pitch = 1.0 } = {}) {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      resolve();
+      return;
+    }
+
+    const cleanText = sanitizeTextForSpeech(text);
+    if (!cleanText) {
+      resolve();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    currentUtterance = utterance;
+    activeUtterances.add(utterance);
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length === 0) {
+      let resolved = false;
+      const handleVoices = () => {
+        if (resolved) return;
+        resolved = true;
+        window.speechSynthesis.removeEventListener('voiceschanged', handleVoices);
+        executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+      };
+      window.speechSynthesis.addEventListener('voiceschanged', handleVoices);
+
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          window.speechSynthesis.removeEventListener('voiceschanged', handleVoices);
+          executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+        }
+      }, 500);
+    } else {
+      executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText });
+    }
+  });
+}
+
+function executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanText }) {
+  const preferredVoice = getPreferredVoice();
+  if (preferredVoice) {
+    utterance.voice = preferredVoice;
+  }
+  utterance.lang = 'en-US';
+  utterance.rate = rate;
+  utterance.pitch = pitch;
+
+  let finished = false;
+  let watchdog = null;
+
+  const cleanup = () => {
+    if (watchdog) {
+      clearTimeout(watchdog);
+      watchdog = null;
+    }
+    activeUtterances.delete(utterance);
+    if (currentUtterance === utterance) {
+      currentUtterance = null;
+    }
+  };
+
+  const finishSpeech = () => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    onEnd?.();
+    resolve();
+  };
+
+  let startTime = Date.now();
+  utterance.onstart = () => {
+    startTime = Date.now();
+    console.log(`%c[TTS] Speaking (${preferredVoice?.name || 'Default'}): "${cleanText.slice(0, 80)}${cleanText.length > 80 ? '...' : ''}"`, 'color: #8b5cf6; font-weight: bold;');
+    onStart?.();
+  };
+
+  utterance.onend = () => {
+    const elapsed = Date.now() - startTime;
+    console.log(`%c[TTS] Finished playback in ${elapsed}ms`, 'color: #a78bfa;');
+    finishSpeech();
+  };
+
+  utterance.onerror = (e) => {
+    console.warn('[TTS] Synthesis event error/cancel:', e);
+    finishSpeech();
+  };
+
+  const words = (cleanText || '').split(/\s+/).length;
+  const estimatedMs = Math.max(4000, (words / 2.5) * 1000 + 4000);
+  watchdog = setTimeout(() => {
+    if (!finished) {
+      console.warn('[TTS] Watchdog timeout reached; resolving speech item.');
+      finishSpeech();
+    }
+  }, estimatedMs);
+
+  try {
+    window.speechSynthesis.speak(utterance);
+  } catch (err) {
+    console.error('[TTS] Speech call failed:', err);
+    finishSpeech();
+  }
+}
+
+async function processQueue() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    return;
+  }
+  isPlaying = true;
+  const nextItem = audioQueue.shift();
+  if (nextItem) {
+    try { await nextItem.run(); } catch (_) {} finally { nextItem.resolve(); }
+  }
+  processQueue();
+}
+
+export function speakText(text, options = {}) {
+  return new Promise((resolve) => {
+    const generation = playbackGeneration;
+    audioQueue.push({
+      resolve,
+      run: async () => { await cloudTTS(text, { ...options, generation }); }
+    });
+    if (!isPlaying) processQueue();
+  });
+}
+
+export function stopAudio() {
+  playbackGeneration += 1;
+  // Resolve queued callers so an interrupted delivery cannot leave promises hanging.
+  const pending = audioQueue;
+  audioQueue = [];
+  for (const item of pending) {
+    try { item.resolve(); } catch (_) {}
+  }
+  if (currentRunResolve) {
+    const resolve = currentRunResolve;
+    currentRunResolve = null;
+    try { resolve(); } catch (_) {}
+  }
+  activeUtterances.clear();
+  if (currentSourceNode) {
+    try {
+      currentSourceNode.stop();
+      currentSourceNode.disconnect();
+    } catch (e) {
+      // ignore
+    }
+    currentSourceNode = null;
+  }
+  if (currentAudioElement) {
+    try {
+      currentAudioElement.pause();
+      currentAudioElement.currentTime = 0;
+    } catch (e) {
+      // ignore
+    }
+    currentAudioElement = null;
+  }
+  if (typeof window !== 'undefined' && window.speechSynthesis) {
+    window.speechSynthesis.cancel();
+  }
+  isPlaying = false;
+  currentUtterance = null;
+  currentRunResolve = null;
+}
+
+
+export function isAudioPlaying() {
+  return isPlaying || Boolean(currentSourceNode) || (typeof window !== 'undefined' && window.speechSynthesis?.speaking);
+}
+
+
+/* --- END FILE: src\voice\speaker.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: src\voice\useInterviewAgent.js --- */
+// File: frontend/src\voice\useInterviewAgent.js
+
+﻿export { useInterviewAgent, default } from '../hooks/useInterviewAgent';
+
+
+/* --- END FILE: src\voice\useInterviewAgent.js --- */
+
+--------------------------------------------------------------------------------
+
+/* --- START FILE: vite.config.js --- */
+// File: frontend/vite.config.js
+
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    host: true,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      }
+    }
+  }
+})
+
+
+/* --- END FILE: vite.config.js --- */
+
+--------------------------------------------------------------------------------
+

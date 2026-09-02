@@ -2,12 +2,14 @@
 // High-fidelity Google Cloud TTS player powered by Web Audio API.
 import { synthesizeSpeech } from '../api';
 
-let audioQueue = [];
+let audioQueue = []; // { run, resolve }
 let isPlaying = false;
 let globalAudioCtx = null;
 let currentSourceNode = null;
 let currentAudioElement = null;
 let currentUtterance = null;
+let currentRunResolve = null;
+let playbackGeneration = 0;
 const activeUtterances = new Set();
 
 function getAudioContext() {
@@ -40,7 +42,7 @@ function sanitizeTextForSpeech(text) {
 /**
  * Synthesizes and plays speech using Google Cloud TTS backend endpoint via Web Audio API.
  */
-async function cloudTTS(text, { onStart, onEnd } = {}) {
+async function cloudTTS(text, { onStart, onEnd, generation } = {}) {
   const cleanText = sanitizeTextForSpeech(text);
   if (!cleanText) return;
 
@@ -49,6 +51,7 @@ async function cloudTTS(text, { onStart, onEnd } = {}) {
 
   try {
     const audioBlob = await synthesizeSpeech(cleanText);
+    if (generation !== playbackGeneration) return;
     const audioCtx = getAudioContext();
 
     if (audioCtx) {
@@ -60,6 +63,8 @@ async function cloudTTS(text, { onStart, onEnd } = {}) {
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
       return new Promise((resolve) => {
+        currentRunResolve = resolve;
+        if (generation !== playbackGeneration) { currentRunResolve = null; resolve(); return; }
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioCtx.destination);
@@ -75,6 +80,7 @@ async function cloudTTS(text, { onStart, onEnd } = {}) {
             currentSourceNode = null;
           }
           onEnd?.();
+          if (currentRunResolve === resolve) currentRunResolve = null;
           resolve();
         };
 
@@ -87,10 +93,12 @@ async function cloudTTS(text, { onStart, onEnd } = {}) {
     } else {
       // HTML5 Audio fallback if AudioContext is unsupported
       const audioUrl = URL.createObjectURL(audioBlob);
+      if (generation !== playbackGeneration) { URL.revokeObjectURL(audioUrl); return; }
       const audio = new Audio(audioUrl);
       currentAudioElement = audio;
 
       return new Promise((resolve) => {
+        currentRunResolve = resolve;
         audio.onplay = () => {
           console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
           onStart?.();
@@ -104,6 +112,7 @@ async function cloudTTS(text, { onStart, onEnd } = {}) {
             currentAudioElement = null;
           }
           onEnd?.();
+          if (currentRunResolve === resolve) currentRunResolve = null;
           resolve();
         };
 
@@ -253,26 +262,35 @@ async function processQueue() {
   isPlaying = true;
   const nextItem = audioQueue.shift();
   if (nextItem) {
-    await nextItem();
+    try { await nextItem.run(); } catch (_) {} finally { nextItem.resolve(); }
   }
   processQueue();
 }
 
 export function speakText(text, options = {}) {
   return new Promise((resolve) => {
-    audioQueue.push(async () => {
-      await cloudTTS(text, options);
-      resolve();
+    const generation = playbackGeneration;
+    audioQueue.push({
+      resolve,
+      run: async () => { await cloudTTS(text, { ...options, generation }); }
     });
-
-    if (!isPlaying) {
-      processQueue();
-    }
+    if (!isPlaying) processQueue();
   });
 }
 
 export function stopAudio() {
+  playbackGeneration += 1;
+  // Resolve queued callers so an interrupted delivery cannot leave promises hanging.
+  const pending = audioQueue;
   audioQueue = [];
+  for (const item of pending) {
+    try { item.resolve(); } catch (_) {}
+  }
+  if (currentRunResolve) {
+    const resolve = currentRunResolve;
+    currentRunResolve = null;
+    try { resolve(); } catch (_) {}
+  }
   activeUtterances.clear();
   if (currentSourceNode) {
     try {
@@ -297,9 +315,10 @@ export function stopAudio() {
   }
   isPlaying = false;
   currentUtterance = null;
+  currentRunResolve = null;
 }
+
 
 export function isAudioPlaying() {
   return isPlaying || Boolean(currentSourceNode) || (typeof window !== 'undefined' && window.speechSynthesis?.speaking);
 }
-

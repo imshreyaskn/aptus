@@ -40,8 +40,8 @@ def get_gemini_model():
         candidate_models = [
             settings.GEMINI_MODEL,
             "gemini-2.5-flash-lite",
-            "gemini-2.0-flash-exp",
-            "gemini-1.5-flash"
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash"
         ]
         
         for m_name in candidate_models:
@@ -123,7 +123,12 @@ def transcribe_audio_groq(
         elapsed_ms = (time.time() - start_time) * 1000
         text = transcription.text.strip()
         confidence = getattr(transcription, 'confidence', 1.0)
-        segments = getattr(transcription, 'segments', [])
+        try:
+            confidence = float(confidence) if confidence is not None else 1.0
+        except (TypeError, ValueError):
+            confidence = 1.0
+        confidence = max(0.0, min(1.0, confidence))
+        segments = getattr(transcription, 'segments', []) or []
 
         result = {
             "text": text,

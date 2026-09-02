@@ -191,5 +191,3 @@ export async function getSessionHistory(sessionId) {
   }
   return res.json();
 }
-
-

@@ -34,6 +34,7 @@ from backend.app.graph.state import InterviewState
 
 import io
 from fastapi.responses import Response, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from backend.app.core.gemini import synthesize_speech_google, transcribe_audio_groq
 
@@ -54,10 +55,13 @@ async def text_to_speech(payload: TTSRequest):
     Synthesizes speech using Google Cloud Text-to-Speech (free tier standard voice).
     Returns MP3 audio stream for instant natural playback.
     """
-    if not payload.text or not payload.text.strip():
+    clean_text = (payload.text or '').strip()
+    if not clean_text:
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if len(clean_text) > 4000:
+        raise HTTPException(status_code=413, detail="Text is too long for a single TTS response.")
     
-    result = synthesize_speech_google(payload.text, language_code=payload.language_code)
+    result = await run_in_threadpool(synthesize_speech_google, clean_text, payload.language_code)
     if result.get("error") or not result.get("audio_content"):
         logger.warning(f"[TTS Route] Google Cloud TTS returned error: {result.get('error')}")
         raise HTTPException(status_code=500, detail=result.get("error", "Speech synthesis failed."))
@@ -78,12 +82,21 @@ async def speech_to_text(
     Transcribes audio bytes using Groq Whisper API (whisper-large-v3-turbo).
     Works with all browser MediaRecorder formats (webm, wav, ogg, mp3, mp4).
     """
+    content_length = audio.headers.get('content-length') if audio.headers else None
+    if content_length:
+        try:
+            if int(content_length) > 12 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Audio payload is too large.")
+        except ValueError:
+            pass
     audio_bytes = await audio.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio payload received.")
     
+    if len(audio_bytes) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio payload is too large.")
     orig_filename = audio.filename or "recording.webm"
-    result = transcribe_audio_groq(audio_bytes, language=language, filename=orig_filename)
+    result = await run_in_threadpool(transcribe_audio_groq, audio_bytes, language, orig_filename)
     if result.get("error") and not result.get("text"):
         logger.warning(f"[STT Route] Groq STT returned error: {result.get('error')}")
         raise HTTPException(status_code=500, detail=result.get("error", "Transcription failed."))

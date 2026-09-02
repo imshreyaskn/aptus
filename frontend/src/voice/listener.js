@@ -1,16 +1,15 @@
 // frontend/src/voice/listener.js
-// Universal Voice Listener with MediaRecorder audio capture, Groq Whisper STT, and live visualizer.
+// Push-to-talk recorder. The button is the endpoint; no autonomous VAD is used.
 import { transcribeAudio } from '../api';
 
 export class VoiceListener {
   constructor(options = {}) {
     this.options = {
       lang: 'en-US',
-      continuous: true,
+      continuous: false,
       interimResults: true,
-      silenceTimeoutMs: 2800, // auto-VAD silence detection threshold
-      autoVAD: true,
-      ...options
+      autoVAD: false,
+      ...options,
     };
 
     this.recognition = null;
@@ -24,120 +23,73 @@ export class VoiceListener {
     this.isRecording = false;
     this.interimTranscript = '';
     this.finalTranscript = '';
-    this.silenceTimer = null;
     this.hasSpoken = false;
+    this._stopPromise = null;
+    this._recordingMimeType = 'audio/webm';
 
-    // Callbacks
     this.onInterim = null;
     this.onFinal = null;
     this.onVolume = null;
-    this.onSilence = null;
+    this.onSilence = null; // retained for compatibility; never fired in PTT mode
     this.onError = null;
     this.onStart = null;
     this.onEnd = null;
   }
 
-  /**
-   * Supported on ALL modern browsers with microphone access.
-   */
   static isSupported() {
-    return typeof navigator !== 'undefined' &&
-      Boolean(navigator.mediaDevices?.getUserMedia);
+    return typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia);
   }
 
   async start() {
     if (this.isRecording) return;
 
     this._cleanupAudioAnalyser();
-    this.audioChunks = [];
-    this.interimTranscript = '';
-    this.finalTranscript = '';
-    this.hasSpoken = false;
+    this._stopPreviewRecognition();
+    this.resetTranscript();
+
+    if (!VoiceListener.isSupported() || typeof MediaRecorder === 'undefined') {
+      const err = new Error('Voice recording is not supported in this browser.');
+      this.onError?.(err);
+      throw err;
+    }
 
     try {
-      // 1. Capture microphone audio stream
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-        }
+        },
       });
 
-      // 2. Start MediaRecorder for backend Groq Whisper STT
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4');
-
-      this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType });
-      this.audioChunks = [];
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+      ];
+      const mimeType = candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+      this._recordingMimeType = mimeType || 'audio/webm';
+      this.mediaRecorder = mimeType
+        ? new MediaRecorder(this.mediaStream, { mimeType })
+        : new MediaRecorder(this.mediaStream);
 
       this.mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          this.audioChunks.push(event.data);
-        }
+        if (event.data?.size) this.audioChunks.push(event.data);
       };
 
-      this.mediaRecorder.start(250); // Slice into 250ms chunks
+      this.mediaRecorder.onerror = (event) => {
+        this.onError?.(event?.error || new Error('Audio recording failed.'));
+      };
 
-      // 3. Start AudioContext analyser for live volume visualizer
-      await this._startAudioAnalyser();
-
-      // 4. Optional parallel Web Speech API for live interim subtitle preview (if browser supports it)
-      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SpeechRec) {
-        try {
-          this.recognition = new SpeechRec();
-          this.recognition.continuous = this.options.continuous;
-          this.recognition.interimResults = this.options.interimResults;
-          this.recognition.lang = this.options.lang;
-
-          this.recognition.onresult = (event) => {
-            let finalStr = '';
-            let interimStr = '';
-
-            for (let i = 0; i < event.results.length; ++i) {
-              const item = event.results[i];
-              if (item.isFinal) {
-                finalStr += item[0].transcript + ' ';
-              } else {
-                interimStr += item[0].transcript;
-              }
-            }
-
-            this.finalTranscript = finalStr.trim();
-            this.interimTranscript = interimStr.trim();
-            this.hasSpoken = Boolean(this.finalTranscript || this.interimTranscript);
-
-            const currentFull = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
-            if (currentFull) {
-              console.log(`%c[STT] Interim preview: "${currentFull}"`, 'color: #06b6d4;');
-              this.onInterim?.(currentFull);
-            }
-
-            if (this.options.autoVAD && this.hasSpoken) {
-              this._resetSilenceTimer();
-            }
-          };
-
-          this.recognition.onerror = (e) => {
-            if (e.error !== 'no-speech') {
-              console.warn('[STT] Browser recognition notice:', e.error);
-            }
-          };
-
-          this.recognition.start();
-        } catch (e) {
-          console.warn('[STT] Browser SpeechRecognition unavailable, using pure MediaRecorder:', e);
-        }
-      }
-
+      this.mediaRecorder.start(250);
       this.isRecording = true;
-      console.log('%c[STT] Microphone recording active (Groq Whisper ready)...', 'color: #10b981; font-weight: bold;');
       this.onStart?.();
 
+      await this._startAudioAnalyser();
+      this._startPreviewRecognition();
+
+      console.log('[STT] Push-to-talk recording active.');
     } catch (err) {
-      console.error('[STT] Failed to acquire microphone stream:', err);
       this._cleanupAudioAnalyser();
       this.isRecording = false;
       this.onError?.(err);
@@ -146,60 +98,64 @@ export class VoiceListener {
   }
 
   async stop() {
-    if (!this.isRecording) return this.finalTranscript;
+    if (this._stopPromise) return this._stopPromise;
+    if (!this.isRecording) return (this.finalTranscript || '').trim();
 
-    this.isRecording = false;
-    this._clearSilenceTimer();
-
-    if (this.recognition) {
-      try {
-        this.recognition.stop();
-      } catch (e) {}
-      this.recognition = null;
+    this._stopPromise = this._stopInternal();
+    try {
+      return await this._stopPromise;
+    } finally {
+      this._stopPromise = null;
     }
+  }
 
-    console.log('%c[STT] Stopped recording. Processing audio with Groq Whisper...', 'color: #3b82f6; font-weight: bold;');
+  async _stopInternal() {
+    this.isRecording = false;
+    this._stopPreviewRecognition();
 
-    let finalResultText = this.finalTranscript;
+    const recorder = this.mediaRecorder;
+    const mimeType = recorder?.mimeType || this._recordingMimeType || 'audio/webm';
 
-    // Compile recorded audio chunks into a Blob
-    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+    if (recorder && recorder.state !== 'inactive') {
       await new Promise((resolve) => {
-        this.mediaRecorder.onstop = resolve;
+        const previousOnStop = recorder.onstop;
+        recorder.onstop = (event) => {
+          try { previousOnStop?.(event); } catch (_) {}
+          resolve();
+        };
         try {
-          this.mediaRecorder.stop();
-        } catch (e) {
+          recorder.stop();
+        } catch (_) {
           resolve();
         }
       });
     }
 
-    if (this.audioChunks.length > 0) {
-      const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
-      const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+    let resultText = (this.finalTranscript || '').trim();
+    const audioBlob = this.audioChunks.length
+      ? new Blob(this.audioChunks, { type: mimeType })
+      : null;
 
-      if (audioBlob.size > 2000) { // More than 2KB of audio
-        try {
-          console.log(`%c[STT][Groq Whisper] Uploading ${audioBlob.size} bytes for transcription...`, 'color: #8b5cf6;');
-          const sttData = await transcribeAudio(audioBlob);
-          if (sttData && sttData.text && sttData.text.trim()) {
-            finalResultText = sttData.text.trim();
-            console.log(`%c[STT][Groq Whisper] Transcribed: "${finalResultText}" (Confidence: ${sttData.confidence})`, 'color: #10b981; font-weight: bold;');
-          }
-        } catch (err) {
-          console.warn('[STT][Groq Whisper] Backend STT error, using local transcript fallback:', err);
+    if (audioBlob && audioBlob.size > 1500) {
+      try {
+        const sttData = await transcribeAudio(audioBlob, this.options.lang?.split('-')[0] || 'en');
+        if (sttData?.text?.trim()) {
+          resultText = sttData.text.trim();
         }
+      } catch (err) {
+        console.warn('[STT] Backend transcription failed; using browser preview transcript:', err);
       }
     }
 
+    this.mediaRecorder = null;
+    this.audioChunks = [];
     this._cleanupAudioAnalyser();
     this.onEnd?.();
 
-    if (finalResultText) {
-      this.onFinal?.(finalResultText);
-    }
-
-    return finalResultText;
+    this.finalTranscript = resultText;
+    this.interimTranscript = '';
+    if (resultText) this.onFinal?.(resultText);
+    return resultText;
   }
 
   resetTranscript() {
@@ -207,31 +163,63 @@ export class VoiceListener {
     this.finalTranscript = '';
     this.audioChunks = [];
     this.hasSpoken = false;
-    this._clearSilenceTimer();
   }
 
-  _resetSilenceTimer() {
-    this._clearSilenceTimer();
-    this.silenceTimer = setTimeout(async () => {
-      if (this.isRecording && this.hasSpoken) {
-        const fullText = await this.stop();
-        if (fullText && fullText.length > 2) {
-          this.onSilence?.(fullText);
+  _startPreviewRecognition() {
+    const SpeechRec = typeof window !== 'undefined'
+      ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+      : null;
+    if (!SpeechRec) return;
+
+    try {
+      const recognition = new SpeechRec();
+      recognition.continuous = this.options.continuous;
+      recognition.interimResults = this.options.interimResults;
+      recognition.lang = this.options.lang;
+
+      recognition.onresult = (event) => {
+        let finalStr = '';
+        let interimStr = '';
+        for (let i = 0; i < event.results.length; i += 1) {
+          const item = event.results[i];
+          const text = item?.[0]?.transcript || '';
+          if (item.isFinal) finalStr += `${text} `;
+          else interimStr += text;
         }
-      }
-    }, this.options.silenceTimeoutMs);
+
+        this.finalTranscript = finalStr.trim();
+        this.interimTranscript = interimStr.trim();
+        const combined = `${this.finalTranscript} ${this.interimTranscript}`.trim();
+        this.hasSpoken = Boolean(combined);
+        if (combined) this.onInterim?.(combined);
+      };
+
+      recognition.onerror = (event) => {
+        if (event?.error !== 'no-speech') {
+          console.warn('[STT] Browser preview recognition:', event?.error || 'unknown error');
+        }
+      };
+
+      recognition.onend = () => {
+        // Browser preview is intentionally best-effort. Never restart automatically.
+      };
+
+      recognition.start();
+      this.recognition = recognition;
+    } catch (err) {
+      console.warn('[STT] Browser preview unavailable; MediaRecorder remains authoritative.', err);
+    }
   }
 
-  _clearSilenceTimer() {
-    if (this.silenceTimer) {
-      clearTimeout(this.silenceTimer);
-      this.silenceTimer = null;
-    }
+  _stopPreviewRecognition() {
+    if (!this.recognition) return;
+    try { this.recognition.stop(); } catch (_) {}
+    this.recognition = null;
   }
 
   async _startAudioAnalyser() {
     try {
-      if (!this.mediaStream) return;
+      if (!this.mediaStream || typeof window === 'undefined') return;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
 
@@ -241,34 +229,20 @@ export class VoiceListener {
       const source = this.audioContext.createMediaStreamSource(this.mediaStream);
       source.connect(this.analyser);
 
-      const bufferLength = this.analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const updateVolume = () => {
+      const data = new Uint8Array(this.analyser.frequencyBinCount);
+      const tick = () => {
         if (!this.isRecording || !this.analyser) return;
-
-        this.analyser.getByteFrequencyData(dataArray);
+        this.analyser.getByteFrequencyData(data);
         let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        const avg = sum / bufferLength;
-        const volume = Math.min(1.0, avg / 128); // Normalize 0.0 to 1.0
-
-        if (volume > 0.08) {
-          this.hasSpoken = true;
-          if (this.options.autoVAD) {
-            this._resetSilenceTimer();
-          }
-        }
-
+        for (let i = 0; i < data.length; i += 1) sum += data[i];
+        const volume = Math.min(1, (sum / Math.max(1, data.length)) / 128);
+        if (volume > 0.05) this.hasSpoken = true;
         this.onVolume?.(volume);
-        this.animationFrameId = requestAnimationFrame(updateVolume);
+        this.animationFrameId = requestAnimationFrame(tick);
       };
-
-      this.animationFrameId = requestAnimationFrame(updateVolume);
+      this.animationFrameId = requestAnimationFrame(tick);
     } catch (err) {
-      console.warn('[STT] Mic volume analyser notice:', err);
+      console.warn('[STT] Audio analyser unavailable:', err);
     }
   }
 
@@ -278,13 +252,13 @@ export class VoiceListener {
       this.animationFrameId = null;
     }
     if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach(track => track.stop());
+      for (const track of this.mediaStream.getTracks()) track.stop();
       this.mediaStream = null;
     }
     if (this.audioContext && this.audioContext.state !== 'closed') {
       this.audioContext.close().catch(() => {});
-      this.audioContext = null;
     }
+    this.audioContext = null;
     this.analyser = null;
     this.onVolume?.(0);
   }
