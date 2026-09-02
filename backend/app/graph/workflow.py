@@ -152,8 +152,8 @@ def step_process_answer(
     Returns:
         Updated InterviewState with evaluation results and next question (or summary if completed)
     """
-    # Convert Pydantic model to dict for graph processing
-    state = current_state.model_dump()
+    # Convert state to dict for graph processing
+    state = current_state.model_dump() if hasattr(current_state, "model_dump") else dict(current_state)
     
     # Create unified Turn object per spec §1 (Pydantic validated)
     from backend.app.graph.state import Turn

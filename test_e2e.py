@@ -11,7 +11,12 @@ Demonstrates the complete workflow:
 """
 
 import sys
-sys.path.insert(0, '/workspace')
+import os
+sys.path.insert(0, os.path.abspath("."))
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 
 from backend.app.adapters.modality import TextAdapter, VoiceAdapter, create_adapter
 from backend.app.graph.workflow import step_process_answer, interview_graph
@@ -36,29 +41,27 @@ def test_adapters():
         "session_001"
     )
     print(f"✓ Text Turn:")
-    print(f"    modality: {text_turn['modality']}")
-    print(f"    asr_confidence: {text_turn['asr_confidence']} (always 1.0 for text)")
-    print(f"    interruption_flag: {text_turn['interruption_flag']}")
-    print(f"    normalized_text: '{text_turn['normalized_text'][:50]}...'")
+    print(f"    modality: {text_turn.modality}")
+    print(f"    asr_confidence: {text_turn.asr_confidence} (always 1.0 for text)")
+    print(f"    interruption_flag: {text_turn.interruption_flag}")
+    print(f"    normalized_text: '{text_turn.normalized_text[:50]}...'")
     
     # Voice adapter
     voice_adapter = create_adapter('voice')
-    print(f"\n✓ Voice Adapter initialized:")
-    print(f"    is_recording: {voice_adapter.is_recording}")
-    print(f"    is_speaking: {voice_adapter.is_speaking}")
+    print(f"\n✓ Voice Adapter initialized: {voice_adapter.__class__.__name__}")
     
     # Simulate voice turn (manually since we don't have real audio)
-    voice_turn: Turn = {
-        "turn_id": "v1",
-        "modality": "voice",
-        "normalized_text": "I think maybe we could use a binary search tree?",
-        "asr_confidence": 0.72,
-        "interruption_flag": False
-    }
+    voice_turn = Turn(
+        turn_id="v1",
+        modality="voice",
+        normalized_text="I think maybe we could use a binary search tree?",
+        asr_confidence=0.72,
+        interruption_flag=False
+    )
     print(f"\n✓ Voice Turn (simulated):")
-    print(f"    modality: {voice_turn['modality']}")
-    print(f"    asr_confidence: {voice_turn['asr_confidence']}")
-    print(f"    normalized_text: '{voice_turn['normalized_text'][:50]}...'")
+    print(f"    modality: {voice_turn.modality}")
+    print(f"    asr_confidence: {voice_turn.asr_confidence}")
+    print(f"    normalized_text: '{voice_turn.normalized_text[:50]}...'")
     
     return text_turn, voice_turn
 
@@ -200,14 +203,16 @@ def test_step_process_answer():
         interruption_flag=False
     )
     
-    print(f"\n  ✓ State after processing:")
-    print(f"    message_history entries: {len(result.get('message_history', []))}")
-    print(f"    insight_buffer entries: {len(result.get('insight_buffer', []))}")
-    print(f"    turn_decision action: {result.get('turn_decision', {}).get('action')}")
-    print(f"    answer_quality: {result.get('answer_quality')}")
+    result_dict = result.model_dump() if hasattr(result, 'model_dump') else dict(result)
     
-    if result.get('message_history'):
-        last_msg = result['message_history'][-1]
+    print(f"\n  ✓ State after processing:")
+    print(f"    message_history entries: {len(result_dict.get('message_history', []))}")
+    print(f"    insight_buffer entries: {len(result_dict.get('insight_buffer', []))}")
+    print(f"    turn_decision action: {result_dict.get('turn_decision', {}).get('action')}")
+    print(f"    answer_quality: {result_dict.get('answer_quality')}")
+    
+    if result_dict.get('message_history'):
+        last_msg = result_dict['message_history'][-1]
         print(f"    last message role: {last_msg.get('role')}")
         print(f"    last message turn_type: {last_msg.get('turn_type')}")
         print(f"    last message modality: {last_msg.get('modality')}")
@@ -286,9 +291,9 @@ def test_uncertainty_types():
 
 
 def main():
-    print("\n" + "╔" + "=" * 68 + "╗")
-    print("║" + " " * 15 + "APTUS INTERVIEW ENGINE - E2E TEST" + " " * 20 + "║")
-    print("╚" + "=" * 68 + "╝")
+    print("\n" + "=" * 70)
+    print(" " * 15 + "APTUS INTERVIEW ENGINE - E2E TEST")
+    print("=" * 70)
     
     try:
         # Run all tests
