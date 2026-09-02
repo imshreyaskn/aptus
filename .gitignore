@@ -1,41 +1,36 @@
-```
-# Dependencies
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
+*.py[cod]
+*$py.class
+*.env
+.env
 .venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
 .coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
 *.log
-*.pot
-*.pyc
-*.pyo
-*.pyd
-.MF
-tags
-TAGS
-maint/coverage/.last_cover_stats
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.mo
-*.pot
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
 .DS_Store
 Thumbs.db
-```
+
+# Credentials & Service Accounts
+*.json.secret
+google_credentials.json
+google_credentials*.json
+
+# Data / FAISS indexes generated at runtime
+data/indexes/
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
