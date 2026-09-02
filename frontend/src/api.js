@@ -1,193 +1,214 @@
 /**
- * Aptus Frontend API Client
- * Type-annotated async HTTP client communicating with FastAPI backend endpoints.
+ * Aptus API boundary.
+ *
+ * Design principles:
+ * - One request primitive for consistent errors/timeouts.
+ * - Abort is always supported for mutable interview operations.
+ * - No service-specific error parsing leaks into UI code.
+ * - Secrets never belong in the browser bundle.
  */
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
+const DEFAULT_TIMEOUT_MS = 30_000;
 
-/**
- * Helper to unwrap JSON error messages from FastAPI responses.
- * @param {Response} res
- * @param {string} fallbackMsg
- * @returns {Promise<Error>}
- */
-async function createApiError(res, fallbackMsg) {
-  const errorData = await res.json().catch(() => ({}));
-  const message = errorData.detail || errorData.message || fallbackMsg;
-  const err = new Error(message);
-  err.status = res.status;
-  return err;
+export class ApiError extends Error {
+  constructor(message, { status = 0, code = 'UNKNOWN', details = null } = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
 }
 
-/**
- * Checks system health and supported roles.
- * @returns {Promise<{ status: string, timestamp: string, gemini_model: string, roles: string[] }>}
- */
-export async function checkHealth() {
-  const res = await fetch(`${API_BASE_URL}/health`);
-  if (!res.ok) throw await createApiError(res, 'Health check failed');
-  return res.json();
+async function parseResponseBody(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return response.json().catch(() => null);
+  }
+  return response.text().catch(() => '');
 }
 
-/**
- * Fetches list of available screening domain tracks.
- * @returns {Promise<{ roles: string[], description: string }>}
- */
-export async function fetchRoles() {
-  const res = await fetch(`${API_BASE_URL}/roles`);
-  if (!res.ok) throw await createApiError(res, 'Failed to fetch roles');
-  return res.json();
+async function request(path, {
+  method = 'GET',
+  body,
+  headers = {},
+  signal,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retry = false,
+} = {}) {
+  const controller = new AbortController();
+  let timeoutId;
+
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener('abort', abortFromCaller, { once: true });
+
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      body,
+      headers,
+      signal: controller.signal,
+    });
+
+    const payload = await parseResponseBody(response);
+
+    if (!response.ok) {
+      const detail = typeof payload === 'object' && payload
+        ? (payload.detail || payload.message)
+        : null;
+      throw new ApiError(detail || `Request failed with status ${response.status}`, {
+        status: response.status,
+        code: response.headers.get('x-error-code') || 'HTTP_ERROR',
+        details: payload,
+      });
+    }
+
+    return payload;
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw error;
+    }
+
+    // Only GETs should ever be retried automatically. Interview mutations are not.
+    if (retry && error instanceof TypeError) {
+      return request(path, {
+        method,
+        body,
+        headers,
+        signal,
+        timeoutMs,
+        retry: false,
+      });
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abortFromCaller);
+  }
 }
 
-/**
- * Initializes a new interview screening session.
- * @param {Object} params
- * @param {string} params.name - Candidate name (letters only)
- * @param {string} params.role - Target role title
- * @param {string|null} [params.resumeText] - Raw pasted resume text
- * @param {File|null} [params.resumeFile] - Uploaded PDF resume file
- * @returns {Promise<Object>} StartInterviewResponse
- */
-export async function startInterview({ name, role, resumeText, resumeFile }) {
+export async function checkHealth({ signal } = {}) {
+  return request('/health', { signal, retry: true });
+}
+
+export async function fetchRoles({ signal } = {}) {
+  return request('/roles', { signal, retry: true });
+}
+
+export async function startInterview({
+  name,
+  role,
+  resumeText,
+  resumeFile,
+  signal,
+}) {
   const formData = new FormData();
   formData.append('name', name || 'Candidate');
   formData.append('role', role);
-  if (resumeText) {
-    formData.append('resume_text', resumeText);
-  }
-  if (resumeFile) {
-    formData.append('resume_file', resumeFile);
-  }
+  if (resumeText?.trim()) formData.append('resume_text', resumeText.trim());
+  if (resumeFile) formData.append('resume_file', resumeFile);
 
-  const res = await fetch(`${API_BASE_URL}/sessions/start`, {
+  return request('/sessions/start', {
     method: 'POST',
     body: formData,
+    signal,
+    timeoutMs: 60_000,
   });
-
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to start interview session');
-  }
-
-  return res.json();
 }
 
-/**
- * Retrieves the next question or completion status for an active session.
- * @param {string} sessionId
- * @returns {Promise<Object>} NextQuestionResponse
- */
-export async function getNextQuestion(sessionId) {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/next-question`);
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to fetch next question');
-  }
-  return res.json();
+export async function getNextQuestion(sessionId, { signal } = {}) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/next-question`, {
+    signal,
+    retry: true,
+  });
 }
 
-/**
- * Submits a candidate answer for real-time evaluation and next-question generation.
- * @param {string} sessionId
- * @param {string} questionId
- * @param {string} answerText
- * @param {AbortSignal} [signal] - Optional abort signal
- * @returns {Promise<Object>} SubmitAnswerResponse
- */
 export async function submitAnswer(sessionId, questionId, answerText, signal) {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/answer`, {
+  if (!sessionId || !questionId) {
+    throw new ApiError('Missing session or question identifier.', { code: 'INVALID_ARGUMENT' });
+  }
+  if (!answerText?.trim()) {
+    throw new ApiError('Answer cannot be empty.', { code: 'INVALID_ARGUMENT' });
+  }
+
+  return request(`/sessions/${encodeURIComponent(sessionId)}/answer`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       question_id: questionId,
-      answer_text: answerText,
+      answer_text: answerText.trim(),
     }),
+    signal,
+    timeoutMs: 60_000,
+  });
+}
+
+export async function endSession(sessionId, { signal } = {}) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/end`, {
+    method: 'POST',
+    signal,
+    timeoutMs: 60_000,
+  });
+}
+
+export async function getSessionSummary(sessionId, { signal } = {}) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/summary`, {
+    signal,
+    retry: true,
+  });
+}
+
+export async function synthesizeSpeech(text, languageCode = 'en-US', { signal } = {}) {
+  if (!text?.trim()) throw new ApiError('TTS text cannot be empty.', { code: 'INVALID_ARGUMENT' });
+
+  const response = await fetch(`${API_BASE_URL}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text.trim(), language_code: languageCode }),
     signal,
   });
 
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to submit answer');
+  if (!response.ok) {
+    const payload = await parseResponseBody(response);
+    const detail = typeof payload === 'object' && payload
+      ? (payload.detail || payload.message)
+      : null;
+    throw new ApiError(detail || `TTS failed with status ${response.status}`, {
+      status: response.status,
+      code: 'TTS_ERROR',
+      details: payload,
+    });
   }
 
-  return res.json();
+  return response.blob();
 }
 
-/**
- * Explicitly terminates an interview session and triggers executive evaluation synthesis.
- * @param {string} sessionId
- * @returns {Promise<Object>} SessionSummaryResponse
- */
-export async function endSession(sessionId) {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/end`, {
-    method: 'POST',
-  });
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to end session');
+export async function transcribeAudio(audioBlob, language = 'en', { signal } = {}) {
+  if (!audioBlob?.size) {
+    throw new ApiError('Audio recording is empty.', { code: 'EMPTY_AUDIO' });
   }
-  return res.json();
-}
 
-/**
- * Fetches the executive evaluation report for a completed session.
- * @param {string} sessionId
- * @returns {Promise<Object>} SessionSummaryResponse
- */
-export async function getSessionSummary(sessionId) {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/summary`);
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to fetch summary');
-  }
-  return res.json();
-}
-
-/**
- * Synthesizes natural speech using Google Cloud TTS.
- * @param {string} text - Text to synthesize
- * @param {string} [languageCode='en-US'] - Language code
- * @returns {Promise<Blob>} Audio blob (MP3)
- */
-export async function synthesizeSpeech(text, languageCode = 'en-US') {
-  const res = await fetch(`${API_BASE_URL}/tts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, language_code: languageCode }),
-  });
-  if (!res.ok) {
-    throw await createApiError(res, 'TTS synthesis failed');
-  }
-  return res.blob();
-}
-
-/**
- * Transcribes audio recording using backend Groq Whisper STT API.
- * @param {Blob} audioBlob - Recorded audio blob
- * @param {string} [language='en'] - Language code
- * @returns {Promise<{ text: string, confidence: number, segments: Array }>}
- */
-export async function transcribeAudio(audioBlob, language = 'en') {
   const formData = new FormData();
-  formData.append('audio', audioBlob, 'recording.webm');
+  const type = audioBlob.type || 'audio/webm';
+  const extension = type.includes('mp4') ? 'mp4' : type.includes('ogg') ? 'ogg' : 'webm';
+  formData.append('audio', audioBlob, `recording.${extension}`);
   formData.append('language', language);
 
-  const res = await fetch(`${API_BASE_URL}/stt`, {
+  return request('/stt', {
     method: 'POST',
     body: formData,
+    signal,
+    timeoutMs: 60_000,
   });
-  if (!res.ok) {
-    throw await createApiError(res, 'STT transcription failed');
-  }
-  return res.json();
 }
 
-/**
- * Fetches full Q&A transcript with judge verdicts and literature chunk traceability.
- * @param {string} sessionId
- * @returns {Promise<Object>} SessionHistoryResponse
- */
-export async function getSessionHistory(sessionId) {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/history`);
-  if (!res.ok) {
-    throw await createApiError(res, 'Failed to fetch history');
-  }
-  return res.json();
+export async function getSessionHistory(sessionId, { signal } = {}) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/history`, {
+    signal,
+    retry: true,
+  });
 }

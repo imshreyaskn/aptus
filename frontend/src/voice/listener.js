@@ -1,60 +1,73 @@
-// frontend/src/voice/listener.js
-// Push-to-talk recorder. The button is the endpoint; no autonomous VAD is used.
 import { transcribeAudio } from '../api';
 
+const MIN_AUDIO_BYTES = 1_500;
+
+function getRecorderMimeType() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  return [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+  ].find((type) => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+/**
+ * Push-to-talk microphone controller.
+ *
+ * Contract:
+ *   start() -> open microphone and collect audio
+ *   stop()  -> finalize recording and return authoritative server transcript
+ *
+ * Browser SpeechRecognition is visualization-only. It never becomes the
+ * authoritative answer source because browser implementations vary.
+ */
 export class VoiceListener {
   constructor(options = {}) {
     this.options = {
       lang: 'en-US',
-      continuous: false,
-      interimResults: true,
-      autoVAD: false,
+      previewRecognition: true,
       ...options,
     };
 
-    this.recognition = null;
     this.mediaStream = null;
     this.mediaRecorder = null;
+    this.recognition = null;
     this.audioChunks = [];
-    this.audioContext = null;
-    this.analyser = null;
-    this.animationFrameId = null;
-
     this.isRecording = false;
     this.interimTranscript = '';
     this.finalTranscript = '';
     this.hasSpoken = false;
     this._stopPromise = null;
-    this._recordingMimeType = 'audio/webm';
+    this._mimeType = 'audio/webm';
 
     this.onInterim = null;
     this.onFinal = null;
     this.onVolume = null;
-    this.onSilence = null; // retained for compatibility; never fired in PTT mode
     this.onError = null;
     this.onStart = null;
     this.onEnd = null;
   }
 
   static isSupported() {
-    return typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia);
+    return typeof navigator !== 'undefined'
+      && Boolean(navigator.mediaDevices?.getUserMedia)
+      && typeof MediaRecorder !== 'undefined';
   }
 
   async start() {
     if (this.isRecording) return;
 
-    this._cleanupAudioAnalyser();
-    this._stopPreviewRecognition();
-    this.resetTranscript();
-
-    if (!VoiceListener.isSupported() || typeof MediaRecorder === 'undefined') {
-      const err = new Error('Voice recording is not supported in this browser.');
-      this.onError?.(err);
-      throw err;
+    if (!VoiceListener.isSupported()) {
+      const error = new Error('Voice recording is not supported in this browser.');
+      this.onError?.(error);
+      throw error;
     }
 
+    this._cleanup();
+    this._resetTranscript();
+
     try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -62,46 +75,38 @@ export class VoiceListener {
         },
       });
 
-      const candidates = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/mp4',
-      ];
-      const mimeType = candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
-      this._recordingMimeType = mimeType || 'audio/webm';
-      this.mediaRecorder = mimeType
-        ? new MediaRecorder(this.mediaStream, { mimeType })
-        : new MediaRecorder(this.mediaStream);
+      this.mediaStream = stream;
+      this._mimeType = getRecorderMimeType() || 'audio/webm';
+      this.mediaRecorder = this._mimeType === 'audio/webm'
+        ? new MediaRecorder(stream)
+        : new MediaRecorder(stream, { mimeType: this._mimeType });
 
-      this.mediaRecorder.ondataavailable = (event) => {
+      this.mediaRecorder.addEventListener('dataavailable', (event) => {
         if (event.data?.size) this.audioChunks.push(event.data);
-      };
+      });
 
-      this.mediaRecorder.onerror = (event) => {
-        this.onError?.(event?.error || new Error('Audio recording failed.'));
-      };
+      this.mediaRecorder.addEventListener('error', (event) => {
+        this.onError?.(event.error || new Error('Audio recording failed.'));
+      });
 
-      this.mediaRecorder.start(250);
+      this.mediaRecorder.start();
       this.isRecording = true;
       this.onStart?.();
 
-      await this._startAudioAnalyser();
       this._startPreviewRecognition();
-
-      console.log('[STT] Push-to-talk recording active.');
-    } catch (err) {
-      this._cleanupAudioAnalyser();
-      this.isRecording = false;
-      this.onError?.(err);
-      throw err;
+      this._startVolumeMeter();
+    } catch (error) {
+      this._cleanup();
+      this.onError?.(error);
+      throw error;
     }
   }
 
   async stop() {
     if (this._stopPromise) return this._stopPromise;
-    if (!this.isRecording) return (this.finalTranscript || '').trim();
+    if (!this.isRecording) return this.finalTranscript.trim();
 
-    this._stopPromise = this._stopInternal();
+    this._stopPromise = this._stop();
     try {
       return await this._stopPromise;
     } finally {
@@ -109,155 +114,170 @@ export class VoiceListener {
     }
   }
 
-  async _stopInternal() {
+  async _stop() {
     this.isRecording = false;
     this._stopPreviewRecognition();
 
     const recorder = this.mediaRecorder;
-    const mimeType = recorder?.mimeType || this._recordingMimeType || 'audio/webm';
-
     if (recorder && recorder.state !== 'inactive') {
       await new Promise((resolve) => {
-        const previousOnStop = recorder.onstop;
-        recorder.onstop = (event) => {
-          try { previousOnStop?.(event); } catch (_) {}
+        const handleStop = () => {
+          recorder.removeEventListener('stop', handleStop);
           resolve();
         };
+        recorder.addEventListener('stop', handleStop, { once: true });
         try {
           recorder.stop();
-        } catch (_) {
+        } catch {
           resolve();
         }
       });
     }
 
-    let resultText = (this.finalTranscript || '').trim();
-    const audioBlob = this.audioChunks.length
-      ? new Blob(this.audioChunks, { type: mimeType })
+    const blob = this.audioChunks.length
+      ? new Blob(this.audioChunks, { type: recorder?.mimeType || this._mimeType })
       : null;
 
-    if (audioBlob && audioBlob.size > 1500) {
+    let authoritativeText = '';
+    if (blob?.size >= MIN_AUDIO_BYTES) {
       try {
-        const sttData = await transcribeAudio(audioBlob, this.options.lang?.split('-')[0] || 'en');
-        if (sttData?.text?.trim()) {
-          resultText = sttData.text.trim();
-        }
-      } catch (err) {
-        console.warn('[STT] Backend transcription failed; using browser preview transcript:', err);
+        const result = await transcribeAudio(
+          blob,
+          this.options.lang.split('-')[0] || 'en',
+        );
+        authoritativeText = result?.text?.trim() || '';
+      } catch (error) {
+        // Safe fallback: only use browser transcript when the server transcription
+        // path itself failed. We still surface the failure to observability/UI.
+        this.onError?.(error);
       }
     }
 
+    const text = authoritativeText || this.finalTranscript.trim();
+
     this.mediaRecorder = null;
     this.audioChunks = [];
-    this._cleanupAudioAnalyser();
+    this._cleanup();
+    this.finalTranscript = text;
+    this.interimTranscript = '';
+
+    if (text) this.onFinal?.(text);
     this.onEnd?.();
 
-    this.finalTranscript = resultText;
-    this.interimTranscript = '';
-    if (resultText) this.onFinal?.(resultText);
-    return resultText;
+    return text;
   }
 
   resetTranscript() {
+    this._resetTranscript();
+  }
+
+  _resetTranscript() {
     this.interimTranscript = '';
     this.finalTranscript = '';
-    this.audioChunks = [];
     this.hasSpoken = false;
+    this.audioChunks = [];
   }
 
   _startPreviewRecognition() {
-    const SpeechRec = typeof window !== 'undefined'
-      ? (window.SpeechRecognition || window.webkitSpeechRecognition)
-      : null;
-    if (!SpeechRec) return;
+    if (!this.options.previewRecognition || typeof window === 'undefined') return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
 
     try {
-      const recognition = new SpeechRec();
-      recognition.continuous = this.options.continuous;
-      recognition.interimResults = this.options.interimResults;
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = true;
       recognition.lang = this.options.lang;
 
       recognition.onresult = (event) => {
-        let finalStr = '';
-        let interimStr = '';
+        let finalText = '';
+        let interimText = '';
+
         for (let i = 0; i < event.results.length; i += 1) {
-          const item = event.results[i];
-          const text = item?.[0]?.transcript || '';
-          if (item.isFinal) finalStr += `${text} `;
-          else interimStr += text;
+          const result = event.results[i];
+          const fragment = result?.[0]?.transcript || '';
+          if (result.isFinal) finalText += `${fragment} `;
+          else interimText += fragment;
         }
 
-        this.finalTranscript = finalStr.trim();
-        this.interimTranscript = interimStr.trim();
+        this.finalTranscript = finalText.trim();
+        this.interimTranscript = interimText.trim();
         const combined = `${this.finalTranscript} ${this.interimTranscript}`.trim();
         this.hasSpoken = Boolean(combined);
+
         if (combined) this.onInterim?.(combined);
       };
 
-      recognition.onerror = (event) => {
-        if (event?.error !== 'no-speech') {
-          console.warn('[STT] Browser preview recognition:', event?.error || 'unknown error');
-        }
+      recognition.onerror = () => {
+        // Preview recognition is deliberately non-critical.
       };
 
       recognition.onend = () => {
-        // Browser preview is intentionally best-effort. Never restart automatically.
+        // Never restart automatically. The user owns microphone activation.
       };
 
       recognition.start();
       this.recognition = recognition;
-    } catch (err) {
-      console.warn('[STT] Browser preview unavailable; MediaRecorder remains authoritative.', err);
+    } catch {
+      this.recognition = null;
     }
   }
 
   _stopPreviewRecognition() {
     if (!this.recognition) return;
-    try { this.recognition.stop(); } catch (_) {}
+    try { this.recognition.stop(); } catch {}
     this.recognition = null;
   }
 
-  async _startAudioAnalyser() {
+  _startVolumeMeter() {
+    if (!this.mediaStream || typeof window === 'undefined') return;
+
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+
     try {
-      if (!this.mediaStream || typeof window === 'undefined') return;
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (!AudioCtx) return;
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      const source = audioContext.createMediaStreamSource(this.mediaStream);
+      source.connect(analyser);
 
-      this.audioContext = new AudioCtx();
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 256;
-      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-      source.connect(this.analyser);
+      this.audioContext = audioContext;
+      this.analyser = analyser;
+      const data = new Uint8Array(analyser.frequencyBinCount);
 
-      const data = new Uint8Array(this.analyser.frequencyBinCount);
       const tick = () => {
         if (!this.isRecording || !this.analyser) return;
-        this.analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i += 1) sum += data[i];
-        const volume = Math.min(1, (sum / Math.max(1, data.length)) / 128);
+        analyser.getByteFrequencyData(data);
+        const average = data.reduce((sum, value) => sum + value, 0) / Math.max(1, data.length);
+        const volume = Math.min(1, average / 128);
         if (volume > 0.05) this.hasSpoken = true;
         this.onVolume?.(volume);
         this.animationFrameId = requestAnimationFrame(tick);
       };
+
       this.animationFrameId = requestAnimationFrame(tick);
-    } catch (err) {
-      console.warn('[STT] Audio analyser unavailable:', err);
+    } catch {
+      // The volume meter is optional UI decoration.
     }
   }
 
-  _cleanupAudioAnalyser() {
+  _cleanup() {
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
     }
+
     if (this.mediaStream) {
-      for (const track of this.mediaStream.getTracks()) track.stop();
+      this.mediaStream.getTracks().forEach((track) => track.stop());
       this.mediaStream = null;
     }
+
     if (this.audioContext && this.audioContext.state !== 'closed') {
       this.audioContext.close().catch(() => {});
     }
+
     this.audioContext = null;
     this.analyser = null;
     this.onVolume?.(0);
