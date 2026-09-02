@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.env
+.venv/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+build/
+.DS_Store
+
+# Data / FAISS indexes generated at runtime
+data/indexes/
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
