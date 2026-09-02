@@ -32,10 +32,66 @@ from backend.app.core.resume_parser import (
 from backend.app.graph.workflow import step_start_interview, step_process_answer
 from backend.app.graph.state import InterviewState
 
+import io
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+from backend.app.core.gemini import synthesize_speech_google, transcribe_audio_groq
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 NAME_REGEX = r"^[A-Za-z]+$"
+
+
+class TTSRequest(BaseModel):
+    text: str
+    language_code: str = "en-US"
+
+
+@router.post("/tts", tags=["Voice & Audio"])
+async def text_to_speech(payload: TTSRequest):
+    """
+    Synthesizes speech using Google Cloud Text-to-Speech (free tier standard voice).
+    Returns MP3 audio stream for instant natural playback.
+    """
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    
+    result = synthesize_speech_google(payload.text, language_code=payload.language_code)
+    if result.get("error") or not result.get("audio_content"):
+        logger.warning(f"[TTS Route] Google Cloud TTS returned error: {result.get('error')}")
+        raise HTTPException(status_code=500, detail=result.get("error", "Speech synthesis failed."))
+    
+    return Response(
+        content=result["audio_content"],
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": "inline; filename=speech.mp3"}
+    )
+
+
+@router.post("/stt", tags=["Voice & Audio"])
+async def speech_to_text(
+    audio: UploadFile = File(...),
+    language: str = Form("en")
+):
+    """
+    Transcribes audio bytes using Groq Whisper API (whisper-large-v3-turbo).
+    Works with all browser MediaRecorder formats (webm, wav, ogg, mp3, mp4).
+    """
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio payload received.")
+    
+    result = transcribe_audio_groq(audio_bytes, language=language)
+    if result.get("error") and not result.get("text"):
+        logger.warning(f"[STT Route] Groq STT returned error: {result.get('error')}")
+        raise HTTPException(status_code=500, detail=result.get("error", "Transcription failed."))
+    
+    return {
+        "text": result.get("text", ""),
+        "confidence": result.get("confidence", 1.0),
+        "segments": result.get("segments", [])
+    }
 
 
 @router.get("/health", tags=["System"])

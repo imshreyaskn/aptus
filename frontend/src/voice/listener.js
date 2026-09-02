@@ -1,5 +1,6 @@
 // frontend/src/voice/listener.js
-// Native Web Speech API STT with AudioContext analyser, resource lifecycle management, and configurable silence/VAD detection.
+// Universal Voice Listener with MediaRecorder audio capture, Groq Whisper STT, and live visualizer.
+import { transcribeAudio } from '../api';
 
 export class VoiceListener {
   constructor(options = {}) {
@@ -14,6 +15,8 @@ export class VoiceListener {
 
     this.recognition = null;
     this.mediaStream = null;
+    this.mediaRecorder = null;
+    this.audioChunks = [];
     this.audioContext = null;
     this.analyser = null;
     this.animationFrameId = null;
@@ -34,101 +37,107 @@ export class VoiceListener {
     this.onEnd = null;
   }
 
+  /**
+   * Supported on ALL modern browsers with microphone access.
+   */
   static isSupported() {
-    return typeof window !== 'undefined' &&
-      ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window);
+    return typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices?.getUserMedia);
   }
 
   async start() {
     if (this.isRecording) return;
 
-    // Clean up any stale media streams or audio contexts before opening new ones
     this._cleanupAudioAnalyser();
-
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
-      const err = new Error('Web Speech API is not supported in this browser.');
-      this.onError?.(err);
-      throw err;
-    }
+    this.audioChunks = [];
+    this.interimTranscript = '';
+    this.finalTranscript = '';
+    this.hasSpoken = false;
 
     try {
-      this.recognition = new SpeechRec();
-      this.recognition.continuous = this.options.continuous;
-      this.recognition.interimResults = this.options.interimResults;
-      this.recognition.lang = this.options.lang;
-      this.interimTranscript = '';
-      this.hasSpoken = false;
+      // 1. Capture microphone audio stream
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
 
-      // Start microphone analyser for live volume levels
+      // 2. Start MediaRecorder for backend Groq Whisper STT
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4');
+
+      this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType });
+      this.audioChunks = [];
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          this.audioChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.start(250); // Slice into 250ms chunks
+
+      // 3. Start AudioContext analyser for live volume visualizer
       await this._startAudioAnalyser();
 
-      this.recognition.onstart = () => {
-        this.isRecording = true;
-        console.log('%c[STT] Listening active...', 'color: #10b981; font-weight: bold;');
-        this.onStart?.();
-      };
+      // 4. Optional parallel Web Speech API for live interim subtitle preview (if browser supports it)
+      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRec) {
+        try {
+          this.recognition = new SpeechRec();
+          this.recognition.continuous = this.options.continuous;
+          this.recognition.interimResults = this.options.interimResults;
+          this.recognition.lang = this.options.lang;
 
-      this.recognition.onresult = (event) => {
-        let finalStr = '';
-        let interimStr = '';
+          this.recognition.onresult = (event) => {
+            let finalStr = '';
+            let interimStr = '';
 
-        for (let i = 0; i < event.results.length; ++i) {
-          const item = event.results[i];
-          if (item.isFinal) {
-            finalStr += item[0].transcript + ' ';
-          } else {
-            interimStr += item[0].transcript;
-          }
+            for (let i = 0; i < event.results.length; ++i) {
+              const item = event.results[i];
+              if (item.isFinal) {
+                finalStr += item[0].transcript + ' ';
+              } else {
+                interimStr += item[0].transcript;
+              }
+            }
+
+            this.finalTranscript = finalStr.trim();
+            this.interimTranscript = interimStr.trim();
+            this.hasSpoken = Boolean(this.finalTranscript || this.interimTranscript);
+
+            const currentFull = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
+            if (currentFull) {
+              console.log(`%c[STT] Interim preview: "${currentFull}"`, 'color: #06b6d4;');
+              this.onInterim?.(currentFull);
+            }
+
+            if (this.options.autoVAD && this.hasSpoken) {
+              this._resetSilenceTimer();
+            }
+          };
+
+          this.recognition.onerror = (e) => {
+            if (e.error !== 'no-speech') {
+              console.warn('[STT] Browser recognition notice:', e.error);
+            }
+          };
+
+          this.recognition.start();
+        } catch (e) {
+          console.warn('[STT] Browser SpeechRecognition unavailable, using pure MediaRecorder:', e);
         }
+      }
 
-        this.finalTranscript = finalStr.trim();
-        this.interimTranscript = interimStr.trim();
-        this.hasSpoken = Boolean(this.finalTranscript || this.interimTranscript);
+      this.isRecording = true;
+      console.log('%c[STT] Microphone recording active (Groq Whisper ready)...', 'color: #10b981; font-weight: bold;');
+      this.onStart?.();
 
-        const currentFull = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
-        if (currentFull) {
-          console.log(`%c[STT] Heard (${this.finalTranscript ? 'Final' : 'Interim'}): "${currentFull}"`, 'color: #06b6d4;');
-        }
-        this.onInterim?.(currentFull);
-
-        if (this.finalTranscript) {
-          console.log(`%c[STT] Finalized Turn: "${this.finalTranscript}"`, 'color: #3b82f6; font-weight: bold;');
-          this.onFinal?.(this.finalTranscript);
-        }
-
-        // Reset silence timer on every new speech packet
-        if (this.options.autoVAD && this.hasSpoken) {
-          this._resetSilenceTimer();
-        }
-      };
-
-      this.recognition.onerror = (event) => {
-        // 'no-speech' is a normal timeout when waiting for user to speak
-        if (event.error !== 'no-speech') {
-          console.warn('[STT] Recognition event warning/error:', event.error);
-          this.onError?.(event);
-        }
-      };
-
-      this.recognition.onend = () => {
-        console.log('%c[STT] Mic session ended', 'color: #94a3b8;');
-        // If still flagged as recording, restart (keeps continuous listening alive)
-        if (this.isRecording) {
-          try {
-            this.recognition.start();
-          } catch (e) {
-            this.isRecording = false;
-            this.onEnd?.();
-          }
-        } else {
-          this.onEnd?.();
-        }
-      };
-
-      this.recognition.start();
     } catch (err) {
-      console.error('[STT] Failed to start recognition or media stream:', err);
+      console.error('[STT] Failed to acquire microphone stream:', err);
       this._cleanupAudioAnalyser();
       this.isRecording = false;
       this.onError?.(err);
@@ -136,40 +145,78 @@ export class VoiceListener {
     }
   }
 
-  stop() {
+  async stop() {
+    if (!this.isRecording) return this.finalTranscript;
+
     this.isRecording = false;
     this._clearSilenceTimer();
 
     if (this.recognition) {
       try {
         this.recognition.stop();
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
       this.recognition = null;
+    }
+
+    console.log('%c[STT] Stopped recording. Processing audio with Groq Whisper...', 'color: #3b82f6; font-weight: bold;');
+
+    let finalResultText = this.finalTranscript;
+
+    // Compile recorded audio chunks into a Blob
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      await new Promise((resolve) => {
+        this.mediaRecorder.onstop = resolve;
+        try {
+          this.mediaRecorder.stop();
+        } catch (e) {
+          resolve();
+        }
+      });
+    }
+
+    if (this.audioChunks.length > 0) {
+      const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
+      const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+
+      if (audioBlob.size > 2000) { // More than 2KB of audio
+        try {
+          console.log(`%c[STT][Groq Whisper] Uploading ${audioBlob.size} bytes for transcription...`, 'color: #8b5cf6;');
+          const sttData = await transcribeAudio(audioBlob);
+          if (sttData && sttData.text && sttData.text.trim()) {
+            finalResultText = sttData.text.trim();
+            console.log(`%c[STT][Groq Whisper] Transcribed: "${finalResultText}" (Confidence: ${sttData.confidence})`, 'color: #10b981; font-weight: bold;');
+          }
+        } catch (err) {
+          console.warn('[STT][Groq Whisper] Backend STT error, using local transcript fallback:', err);
+        }
+      }
     }
 
     this._cleanupAudioAnalyser();
     this.onEnd?.();
 
-    const fullTranscript = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
-    return fullTranscript;
+    if (finalResultText) {
+      this.onFinal?.(finalResultText);
+    }
+
+    return finalResultText;
   }
 
   resetTranscript() {
     this.interimTranscript = '';
     this.finalTranscript = '';
+    this.audioChunks = [];
     this.hasSpoken = false;
     this._clearSilenceTimer();
   }
 
   _resetSilenceTimer() {
     this._clearSilenceTimer();
-    this.silenceTimer = setTimeout(() => {
+    this.silenceTimer = setTimeout(async () => {
       if (this.isRecording && this.hasSpoken) {
-        const fullTranscript = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
-        if (fullTranscript.length > 2) {
-          this.onSilence?.(fullTranscript);
+        const fullText = await this.stop();
+        if (fullText && fullText.length > 2) {
+          this.onSilence?.(fullText);
         }
       }
     }, this.options.silenceTimeoutMs);
@@ -184,8 +231,7 @@ export class VoiceListener {
 
   async _startAudioAnalyser() {
     try {
-      if (!navigator.mediaDevices?.getUserMedia) return;
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!this.mediaStream) return;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
 
@@ -209,13 +255,20 @@ export class VoiceListener {
         const avg = sum / bufferLength;
         const volume = Math.min(1.0, avg / 128); // Normalize 0.0 to 1.0
 
+        if (volume > 0.08) {
+          this.hasSpoken = true;
+          if (this.options.autoVAD) {
+            this._resetSilenceTimer();
+          }
+        }
+
         this.onVolume?.(volume);
         this.animationFrameId = requestAnimationFrame(updateVolume);
       };
 
       this.animationFrameId = requestAnimationFrame(updateVolume);
     } catch (err) {
-      console.warn('[STT] Mic volume analyser unavailable:', err);
+      console.warn('[STT] Mic volume analyser notice:', err);
     }
   }
 

@@ -141,6 +141,45 @@ export async function getSessionSummary(sessionId) {
 }
 
 /**
+ * Synthesizes natural speech using Google Cloud TTS.
+ * @param {string} text - Text to synthesize
+ * @param {string} [languageCode='en-US'] - Language code
+ * @returns {Promise<Blob>} Audio blob (MP3)
+ */
+export async function synthesizeSpeech(text, languageCode = 'en-US') {
+  const res = await fetch(`${API_BASE_URL}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, language_code: languageCode }),
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'TTS synthesis failed');
+  }
+  return res.blob();
+}
+
+/**
+ * Transcribes audio recording using backend Groq Whisper STT API.
+ * @param {Blob} audioBlob - Recorded audio blob
+ * @param {string} [language='en'] - Language code
+ * @returns {Promise<{ text: string, confidence: number, segments: Array }>}
+ */
+export async function transcribeAudio(audioBlob, language = 'en') {
+  const formData = new FormData();
+  formData.append('audio', audioBlob, 'recording.webm');
+  formData.append('language', language);
+
+  const res = await fetch(`${API_BASE_URL}/stt`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    throw await createApiError(res, 'STT transcription failed');
+  }
+  return res.json();
+}
+
+/**
  * Fetches full Q&A transcript with judge verdicts and literature chunk traceability.
  * @param {string} sessionId
  * @returns {Promise<Object>} SessionHistoryResponse
@@ -152,3 +191,5 @@ export async function getSessionHistory(sessionId) {
   }
   return res.json();
 }
+
+

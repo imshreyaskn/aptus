@@ -1,8 +1,10 @@
 // frontend/src/voice/speaker.js
-// Production-grade browser SpeechSynthesis queue with markdown sanitization, GC pinning, and watchdog timeouts.
+// Production-grade Google Cloud TTS player with browser SpeechSynthesis fallback.
+import { synthesizeSpeech } from '../api';
 
 let audioQueue = [];
 let isPlaying = false;
+let currentAudioElement = null;
 let currentUtterance = null;
 const activeUtterances = new Set();
 
@@ -19,12 +21,61 @@ function sanitizeTextForSpeech(text) {
     .trim();
 }
 
+/**
+ * Synthesizes and plays speech using Google Cloud TTS backend endpoint.
+ */
+async function cloudTTS(text, { onStart, onEnd } = {}) {
+  const cleanText = sanitizeTextForSpeech(text);
+  if (!cleanText) return;
+
+  const startTime = Date.now();
+  console.log(`%c[TTS][Google Cloud] Requesting audio for: "${cleanText.slice(0, 70)}..."`, 'color: #8b5cf6; font-weight: bold;');
+
+  try {
+    const audioBlob = await synthesizeSpeech(cleanText);
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    currentAudioElement = audio;
+
+    return new Promise((resolve) => {
+      audio.onplay = () => {
+        console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+        onStart?.();
+      };
+
+      const finish = () => {
+        const elapsed = Date.now() - startTime;
+        console.log(`%c[TTS][Google Cloud] Finished playback in ${elapsed}ms`, 'color: #a78bfa;');
+        URL.revokeObjectURL(audioUrl);
+        if (currentAudioElement === audio) {
+          currentAudioElement = null;
+        }
+        onEnd?.();
+        resolve();
+      };
+
+      audio.onended = finish;
+      audio.onerror = (e) => {
+        console.warn('[TTS][Google Cloud] Audio playback error, falling back:', e);
+        finish();
+      };
+
+      audio.play().catch((err) => {
+        console.warn('[TTS][Google Cloud] Audio play() prevented:', err);
+        finish();
+      });
+    });
+  } catch (err) {
+    console.warn('[TTS] Google Cloud TTS synthesis failed; falling back to browser synthesis:', err);
+    return browserTTS(text, { onStart, onEnd });
+  }
+}
+
 function getPreferredVoice() {
   if (typeof window === 'undefined' || !window.speechSynthesis) return null;
   const voices = window.speechSynthesis.getVoices();
   if (!voices || voices.length === 0) return null;
 
-  // Prefer high quality natural English voices
   return (
     voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Ava') || v.name.includes('Jenny'))) ||
     voices.find(v => v.lang.startsWith('en') && (v.name.includes('Zira') || v.name.includes('David') || v.name.includes('Daniel'))) ||
@@ -61,7 +112,6 @@ function browserTTS(text, { onStart, onEnd, rate = 1.0, pitch = 1.0 } = {}) {
       };
       window.speechSynthesis.addEventListener('voiceschanged', handleVoices);
 
-      // Timeout fallback if voiceschanged never fires
       setTimeout(() => {
         if (!resolved) {
           resolved = true;
@@ -124,7 +174,6 @@ function executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanT
     finishSpeech();
   };
 
-  // Watchdog timeout to prevent hung queue if browser engine fails to fire onend
   const words = (cleanText || '').split(/\s+/).length;
   const estimatedMs = Math.max(4000, (words / 2.5) * 1000 + 4000);
   watchdog = setTimeout(() => {
@@ -158,7 +207,7 @@ async function processQueue() {
 export function speakText(text, options = {}) {
   return new Promise((resolve) => {
     audioQueue.push(async () => {
-      await browserTTS(text, options);
+      await cloudTTS(text, options);
       resolve();
     });
 
@@ -171,6 +220,15 @@ export function speakText(text, options = {}) {
 export function stopAudio() {
   audioQueue = [];
   activeUtterances.clear();
+  if (currentAudioElement) {
+    try {
+      currentAudioElement.pause();
+      currentAudioElement.currentTime = 0;
+    } catch (e) {
+      // ignore
+    }
+    currentAudioElement = null;
+  }
   if (typeof window !== 'undefined' && window.speechSynthesis) {
     window.speechSynthesis.cancel();
   }
