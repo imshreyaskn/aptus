@@ -1,5 +1,3 @@
-// File: frontend/src\components\ResultsScreen.jsx
-
 import React, { useState } from 'react';
 import { ChevronDown, ChevronUp, ArrowRight, BookOpen, CheckCircle2, AlertCircle, Award, Sparkles } from 'lucide-react';
 import TraceabilityModal from './TraceabilityModal';
@@ -34,16 +32,8 @@ export default function ResultsScreen({
     ? (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1)
     : '—';
 
-  const plannedTopics = history?.topics_planned || [];
-  const coveredTopics = new Set(
-    answeredQAs
-      .map((qa) => String(qa.topic || '').trim().toLowerCase())
-      .filter(Boolean)
-  );
-  const totalPlanned = plannedTopics.length || coveredTopics.size || 1;
-  const completionPercent = totalPlanned > 0
-    ? Math.min(100, Math.round((coveredTopics.size / totalPlanned) * 100))
-    : 0;
+  const totalPlanned = history?.topics_planned?.length || Math.max(1, qaPairs.length);
+  const completionPercent = totalPlanned > 0 ? Math.min(100, Math.round((answeredCount / totalPlanned) * 100)) : 0;
   const completionStatus = completionPercent >= 100 ? 'COMPLETE' : completionPercent === 0 ? '0%' : `${completionPercent}%`;
 
   const radius = 36;
@@ -167,13 +157,11 @@ export default function ResultsScreen({
               {answeredCount}
             </span>
             <span className="text-body-l" style={{ color: 'var(--color-text-secondary)', fontWeight: '500' }}>
-              / {answeredCount}
+              / {totalPlanned}
             </span>
           </div>
           <span className="text-micro-data" style={{ color: 'var(--color-text-muted)' }}>
-            {Math.max(0, totalPlanned - coveredTopics.size) > 0
-              ? `${Math.max(0, totalPlanned - coveredTopics.size)} topics remaining`
-              : 'Full syllabus covered'}
+            {totalPlanned - answeredCount > 0 ? `${totalPlanned - answeredCount} topics remaining` : 'Full syllabus covered'}
           </span>
         </div>
 

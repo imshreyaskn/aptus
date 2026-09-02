@@ -1,11 +1,9 @@
-// File: frontend/src\components\InterviewAgentScreen.jsx
-
 // frontend/src/components/InterviewAgentScreen.jsx
 // Clean chat + voice interview interface styled consistently with the landing page
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Mic, Volume2,
+  Mic, Volume2, Pause,
   Check, Circle, Loader2,
   ListTodo, X, Send, LogOut
 } from 'lucide-react';
@@ -52,7 +50,7 @@ function InterviewAgentScreen({
 
   const handleTextSubmit = async (e) => {
     e?.preventDefault();
-    const text = inputText.trim();
+    const text = inputText.trim() || agent.liveTranscript.trim();
     if (!text) return;
     setInputText('');
     await agent.submitText(text);
@@ -68,12 +66,7 @@ function InterviewAgentScreen({
   const coveredTodos = agent.plan?.todos.filter(t => t.status === 'covered' || t.status === 'reviewed') || [];
   const totalTodos = agent.plan?.todos.length || 0;
   const isBusy = agent.isProcessing || agent.isPlanning;
-  const canSend = Boolean(
-    agent.hasStarted &&
-    !isBusy &&
-    !agent.isComplete &&
-    inputText.trim()
-  );
+  const canSend = agent.hasStarted && !isBusy && !agent.isComplete && (inputText.trim() || agent.liveTranscript.trim());
 
   return (
     <div style={{
@@ -137,7 +130,7 @@ function InterviewAgentScreen({
               color: 'var(--color-text-secondary)',
               cursor: 'pointer'
             }}
-            title="End interview and view evaluation summary" aria-label="End interview"
+            title="End interview and view evaluation summary"
           >
             <LogOut size={13} />
             <span>End</span>
@@ -444,7 +437,6 @@ function InterviewAgentScreen({
           onBlur={() => setIsFocused(false)}
           onKeyDown={handleKeyDown}
           disabled={!agent.hasStarted || agent.isComplete || isBusy}
-          aria-label="Interview answer"
           placeholder={
             isBusy
               ? "Evaluating response..."
@@ -474,7 +466,6 @@ function InterviewAgentScreen({
           type="button"
           onClick={handleOrbClick}
           disabled={isBusy || agent.isComplete}
-          aria-label={agent.isListening ? 'Stop recording and send answer' : agent.isSpeaking ? 'Interrupt interviewer and start recording' : 'Start voice recording'}
           className="btn-liquid-glass"
           style={{
             padding: '8px 18px',
@@ -504,7 +495,6 @@ function InterviewAgentScreen({
         <button
           type="submit"
           disabled={!canSend}
-          aria-label="Send answer"
           className="btn-liquid-glass"
           style={{
             padding: '8px 18px',
