@@ -7,6 +7,8 @@ let isPlaying = false;
 let globalAudioCtx = null;
 let currentSourceNode = null;
 let currentAudioElement = null;
+let currentUtterance = null;
+const activeUtterances = new Set();
 
 function getAudioContext() {
   if (typeof window === 'undefined') return null;
