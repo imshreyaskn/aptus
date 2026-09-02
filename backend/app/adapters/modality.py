@@ -166,6 +166,7 @@ class VoiceAdapter:
             updated_state["_audio_buffer"] = None
             return None, updated_state
         
+        logger.info(f"[VoiceAdapter] Session {session_id} - Stop recording requested. Dispatching {len(audio_buffer)} bytes to Groq STT...")
         # Transcribe via Groq
         stt_result = transcribe_audio_groq(
             audio_bytes=audio_buffer,
@@ -176,7 +177,7 @@ class VoiceAdapter:
         updated_state["_audio_buffer"] = None
         
         if stt_result.get("error"):
-            logger.error(f"VoiceAdapter: STT failed - {stt_result['error']}")
+            logger.error(f"[VoiceAdapter] Session {session_id} - STT transcription failed: {stt_result['error']}")
             # Still create a Turn but with empty text and low confidence
             turn = Turn(
                 modality="voice",
@@ -193,8 +194,8 @@ class VoiceAdapter:
             )
             
             logger.info(
-                f"VoiceAdapter: Transcribed {len(turn.normalized_text)} chars "
-                f"(confidence: {turn.asr_confidence:.2f})"
+                f"[VoiceAdapter] Session {session_id} - Turn created: {len(turn.normalized_text)} chars "
+                f"(confidence: {turn.asr_confidence:.2f}) | Text: '{turn.normalized_text[:80]}...'"
             )
         
         return turn, updated_state

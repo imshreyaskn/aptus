@@ -77,9 +77,13 @@ def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
             - confidence: confidence score (0-1)
             - segments: optional list of word-level segments with timestamps
     """
+    import time
+    start_time = time.time()
+    logger.info(f"[STT][Groq Whisper] Received audio payload: {len(audio_bytes)} bytes | language={language}")
+
     groq_api_key = settings.GROQ_API_KEY
     if not groq_api_key:
-        logger.warning("GROQ_API_KEY not set. STT will fail.")
+        logger.warning("[STT][Groq Whisper] GROQ_API_KEY is not set. STT will fail.")
         return {"text": "", "confidence": 0.0, "error": "GROQ_API_KEY not configured"}
     
     try:
@@ -92,6 +96,7 @@ def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = "audio.wav"  # Hint the file type
         
+        logger.info("[STT][Groq Whisper] Dispatching transcription request to whisper-large-v3-turbo...")
         transcription = client.audio.transcriptions.create(
             file=audio_file,
             model="whisper-large-v3-turbo",  # Groq's free whisper model
@@ -99,17 +104,26 @@ def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
             response_format="verbose_json"  # Gets confidence and segments
         )
         
+        elapsed_ms = (time.time() - start_time) * 1000
+        text = transcription.text.strip()
+        confidence = getattr(transcription, 'confidence', 1.0)
+        segments = getattr(transcription, 'segments', [])
+
         result = {
-            "text": transcription.text,
-            "confidence": getattr(transcription, 'confidence', 1.0),
-            "segments": getattr(transcription, 'segments', [])
+            "text": text,
+            "confidence": confidence,
+            "segments": segments
         }
         
-        logger.info(f"Groq STT successful: {len(result['text'])} chars transcribed")
+        logger.info(
+            f"[STT][Groq Whisper] SUCCESS in {elapsed_ms:.1f}ms | "
+            f"Confidence: {confidence:.2f} | Segments: {len(segments)} | Text: '{text[:120]}...'"
+        )
         return result
         
     except Exception as e:
-        logger.error(f"Groq STT failed: {e}")
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"[STT][Groq Whisper] FAILED after {elapsed_ms:.1f}ms: {e}")
         return {"text": "", "confidence": 0.0, "error": str(e)}
 
 
@@ -126,14 +140,17 @@ def synthesize_speech_google(text: str, language_code: str = "en-US") -> dict:
             - audio_content: base64-encoded audio bytes (MP3)
             - audio_config: config used for synthesis
     """
+    import time
+    start_time = time.time()
+    logger.info(f"[TTS][Google Cloud] Received synthesis request for {len(text)} chars | lang={language_code} | preview: '{text[:80]}...'")
+
     google_creds = settings.GOOGLE_CLOUD_CREDENTIALS
     if not google_creds:
-        logger.warning("GOOGLE_CLOUD_CREDENTIALS not set. TTS will fail.")
+        logger.warning("[TTS][Google Cloud] GOOGLE_CLOUD_CREDENTIALS is not set. TTS will fail.")
         return {"audio_content": b"", "error": "GOOGLE_CLOUD_CREDENTIALS not configured"}
     
     try:
         from google.cloud import texttospeech
-        import base64
         import json
         
         # Load credentials from JSON string
@@ -159,26 +176,32 @@ def synthesize_speech_google(text: str, language_code: str = "en-US") -> dict:
             pitch=0.0
         )
         
+        logger.info("[TTS][Google Cloud] Calling synthesize_speech API with en-US-Standard-A...")
         response = client.synthesize_speech(
             input=synthesis_input,
             voice=voice,
             audio_config=audio_config
         )
         
+        elapsed_ms = (time.time() - start_time) * 1000
+        audio_bytes = response.audio_content
+        logger.info(
+            f"[TTS][Google Cloud] SUCCESS in {elapsed_ms:.1f}ms | Generated {len(audio_bytes)} bytes of MP3 audio"
+        )
+
         result = {
-            "audio_content": response.audio_content,
+            "audio_content": audio_bytes,
             "audio_config": {
                 "encoding": "MP3",
                 "sample_rate_hertz": 24000,
                 "voice": "en-US-Standard-A"
             }
         }
-        
-        logger.info(f"Google TTS successful: {len(response.audio_content)} bytes generated")
         return result
         
     except Exception as e:
-        logger.error(f"Google Cloud TTS failed: {e}")
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"[TTS][Google Cloud] FAILED after {elapsed_ms:.1f}ms: {e}")
         return {"audio_content": b"", "error": str(e)}
 
 

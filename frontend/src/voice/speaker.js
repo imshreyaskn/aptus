@@ -106,11 +106,16 @@ function executeSpeech(utterance, resolve, { onStart, onEnd, rate, pitch, cleanT
     resolve();
   };
 
+  let startTime = Date.now();
   utterance.onstart = () => {
+    startTime = Date.now();
+    console.log(`%c[TTS] Speaking (${preferredVoice?.name || 'Default'}): "${cleanText.slice(0, 80)}${cleanText.length > 80 ? '...' : ''}"`, 'color: #8b5cf6; font-weight: bold;');
     onStart?.();
   };
 
   utterance.onend = () => {
+    const elapsed = Date.now() - startTime;
+    console.log(`%c[TTS] Finished playback in ${elapsed}ms`, 'color: #a78bfa;');
     finishSpeech();
   };
 

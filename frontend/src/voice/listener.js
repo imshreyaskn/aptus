@@ -65,6 +65,7 @@ export class VoiceListener {
 
       this.recognition.onstart = () => {
         this.isRecording = true;
+        console.log('%c[STT] Listening active...', 'color: #10b981; font-weight: bold;');
         this.onStart?.();
       };
 
@@ -86,9 +87,13 @@ export class VoiceListener {
         this.hasSpoken = Boolean(this.finalTranscript || this.interimTranscript);
 
         const currentFull = (this.finalTranscript + (this.interimTranscript ? ' ' + this.interimTranscript : '')).trim();
+        if (currentFull) {
+          console.log(`%c[STT] Heard (${this.finalTranscript ? 'Final' : 'Interim'}): "${currentFull}"`, 'color: #06b6d4;');
+        }
         this.onInterim?.(currentFull);
 
         if (this.finalTranscript) {
+          console.log(`%c[STT] Finalized Turn: "${this.finalTranscript}"`, 'color: #3b82f6; font-weight: bold;');
           this.onFinal?.(this.finalTranscript);
         }
 
@@ -101,12 +106,13 @@ export class VoiceListener {
       this.recognition.onerror = (event) => {
         // 'no-speech' is a normal timeout when waiting for user to speak
         if (event.error !== 'no-speech') {
-          console.warn('[STT] Recognition error:', event.error);
+          console.warn('[STT] Recognition event warning/error:', event.error);
           this.onError?.(event);
         }
       };
 
       this.recognition.onend = () => {
+        console.log('%c[STT] Mic session ended', 'color: #94a3b8;');
         // If still flagged as recording, restart (keeps continuous listening alive)
         if (this.isRecording) {
           try {
