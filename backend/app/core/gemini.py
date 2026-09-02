@@ -1,6 +1,7 @@
 """
 Gemini LLM Client & Structured Output Generator
 Interfaces with Google Generative AI with Pydantic validation and fallback factories.
+Also provides Groq STT adapter for voice transcription.
 """
 
 import json
@@ -38,9 +39,9 @@ def get_gemini_model():
         
         candidate_models = [
             settings.GEMINI_MODEL,
-            "gemini-3.1-flash-lite",
-            "gemini-3.6-flash",
-            "gemini-2.5-flash-lite"
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-flash"
         ]
         
         for m_name in candidate_models:
@@ -60,6 +61,125 @@ def get_gemini_model():
     except Exception as e:
         logger.error(f"Failed to initialize google.generativeai model: {e}")
         return None
+
+
+def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
+    """
+    Transcribes audio using Groq's free STT API.
+    
+    Args:
+        audio_bytes: Raw audio data (WAV format preferred)
+        language: Language code for transcription
+        
+    Returns:
+        dict with keys:
+            - text: transcribed text
+            - confidence: confidence score (0-1)
+            - segments: optional list of word-level segments with timestamps
+    """
+    groq_api_key = settings.GROQ_API_KEY
+    if not groq_api_key:
+        logger.warning("GROQ_API_KEY not set. STT will fail.")
+        return {"text": "", "confidence": 0.0, "error": "GROQ_API_KEY not configured"}
+    
+    try:
+        from groq import Groq
+        
+        client = Groq(api_key=groq_api_key)
+        
+        # Groq requires file-like object, so we use BytesIO
+        import io
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "audio.wav"  # Hint the file type
+        
+        transcription = client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-large-v3-turbo",  # Groq's free whisper model
+            language=language,
+            response_format="verbose_json"  # Gets confidence and segments
+        )
+        
+        result = {
+            "text": transcription.text,
+            "confidence": getattr(transcription, 'confidence', 1.0),
+            "segments": getattr(transcription, 'segments', [])
+        }
+        
+        logger.info(f"Groq STT successful: {len(result['text'])} chars transcribed")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Groq STT failed: {e}")
+        return {"text": "", "confidence": 0.0, "error": str(e)}
+
+
+def synthesize_speech_google(text: str, language_code: str = "en-US") -> dict:
+    """
+    Synthesizes speech using Google Cloud TTS (free tier standard voice).
+    
+    Args:
+        text: Text to synthesize
+        language_code: BCP-47 language code
+        
+    Returns:
+        dict with keys:
+            - audio_content: base64-encoded audio bytes (MP3)
+            - audio_config: config used for synthesis
+    """
+    google_creds = settings.GOOGLE_CLOUD_CREDENTIALS
+    if not google_creds:
+        logger.warning("GOOGLE_CLOUD_CREDENTIALS not set. TTS will fail.")
+        return {"audio_content": b"", "error": "GOOGLE_CLOUD_CREDENTIALS not configured"}
+    
+    try:
+        from google.cloud import texttospeech
+        import base64
+        import json
+        
+        # Load credentials from JSON string
+        creds_info = json.loads(google_creds)
+        from google.oauth2 import service_account
+        credentials = service_account.Credentials.from_service_account_info(creds_info)
+        
+        client = texttospeech.TextToSpeechClient(credentials=credentials)
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        # Standard voice (free tier) - en-US-Standard-A
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=language_code,
+            name="en-US-Standard-A",  # Free tier standard voice
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        
+        # MP3 output (smaller, good for streaming)
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,
+            pitch=0.0
+        )
+        
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        result = {
+            "audio_content": response.audio_content,
+            "audio_config": {
+                "encoding": "MP3",
+                "sample_rate_hertz": 24000,
+                "voice": "en-US-Standard-A"
+            }
+        }
+        
+        logger.info(f"Google TTS successful: {len(response.audio_content)} bytes generated")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Google Cloud TTS failed: {e}")
+        return {"audio_content": b"", "error": str(e)}
 
 
 def _clean_json_markdown(raw_text: str) -> str:

@@ -1,8 +1,9 @@
+from typing import Dict, Any, List, Literal, Optional
+from uuid import uuid4
 import json
 import logging
-from typing import Dict, Any, List
 from backend.app.config import settings
-from backend.app.graph.state import InterviewState
+from backend.app.graph.state import InterviewState, Turn, InsightEntry
 from backend.app.schemas.interview import (
     ResumeProfile,
     TopicPlan,
@@ -10,9 +11,10 @@ from backend.app.schemas.interview import (
     GeneratedQuestion,
     JudgeVerdict,
     FinalSummary,
-    TurnDecision
+    TurnDecision,
 )
-from backend.app.core.gemini import generate_structured
+from pydantic import BaseModel, Field
+from backend.app.core.gemini import generate_structured, transcribe_audio_groq, synthesize_speech_google
 from backend.app.core.resume_parser import validate_and_parse_resume, parse_resume_to_profile
 from backend.app.rag.retriever import retrieve_chunks, format_chunks_for_prompt
 
@@ -302,76 +304,288 @@ def generate_question_node(state: InterviewState) -> Dict[str, Any]:
     }
 
 
-# --- Node: turn_director ---
-def turn_director_node(state: InterviewState) -> Dict[str, Any]:
+# --- Node: classify_and_evaluate (merged per §3) ---
+class ClassifyAndEvaluateResult(BaseModel):
+    """Combined output for turn classification and answer evaluation."""
+    turn_type: Literal["answer", "meta_question", "repeat_request", "clarification", "smalltalk", "noise", "end_request"] = Field(
+        description="Classification of the candidate's turn type"
+    )
+    action: Literal["advance", "stay", "conclude"] = Field(
+        description="Whether to advance to next question, stay on current, or conclude interview"
+    )
+    interviewer_reply: str = Field(default="", description="Conversational response to candidate")
+    
+    # Evaluation fields (only populated when turn_type == "answer")
+    score: Optional[int] = Field(default=None, ge=1, le=10, description="Technical score 1-10")
+    depth: Optional[Literal["insufficient", "adequate", "deep"]] = None
+    correctness: Optional[Literal["incorrect", "partially_correct", "correct"]] = None
+    relevance: Optional[Literal["off_topic", "somewhat_relevant", "highly_relevant"]] = None
+    feedback: Optional[str] = None
+    suggested_next_difficulty: Optional[Literal["junior", "mid", "senior"]] = None
+    
+    # Uncertainty detection
+    uncertainty_type: Optional[Literal[
+        "asr_low_conf", "candidate_hedging", "silence_timeout", 
+        "off_topic", "ambiguous", "meta_question", "none"
+    ]] = Field(default="none", description="Type of uncertainty detected, if any")
+    
+    # Flags
+    hedging_detected: bool = Field(default=False)
+    contradicts_resume: bool = Field(default=False)
+
+
+def classify_and_evaluate_node(state: InterviewState) -> Dict[str, Any]:
     """
-    Intelligently analyzes the candidate's turn in full conversational context:
-    - 'answer': Candidate gave a technical answer/attempt -> action: 'advance'
-    - 'forfeit': Candidate explicitly concedes ('I don't know', 'skip') -> action: 'advance'
-    - 'clarification': Candidate asks for a hint/clarification -> action: 'stay'
-    - 'smalltalk_or_greeting': Casual greeting/pleasantry -> action: 'stay'
-    - 'noise_or_incomplete': Stray word, noise, or fragment (< 3 words) -> action: 'stay'
-    - 'end_request': Requesting to conclude the interview -> action: 'conclude'
+    Merged node per §3: Single LLM call that classifies turn_type AND evaluates if it's an answer.
+    This replaces separate turn_director_node + judge_answer_node, halving latency-critical LLM calls.
+    
+    Handles:
+    - turn_type classification (answer/meta_question/repeat_request/clarification/smalltalk/noise/end_request)
+    - answer evaluation (score, depth, correctness, relevance) when turn_type == "answer"
+    - uncertainty detection (asr_low_conf, candidate_hedging, silence_timeout, off_topic, ambiguous)
+    - escalation signals (hedging_detected, contradicts_resume)
     """
+    logger.info(f"Executing classify_and_evaluate_node for session {state.get('session_id')}")
+    
     candidate_name = state.get("candidate_name", "Candidate")
     question_data = state.get("current_question", {})
-    answer_text = (state.get("last_answer_text") or "").strip()
+    last_turn = state.get("last_turn", {})
+    answer_text = (last_turn.get("normalized_text") or "").strip()
+    asr_confidence = last_turn.get("asr_confidence", 1.0)
+    interruption_flag = last_turn.get("interruption_flag", False)
+    
     topic = question_data.get("topic", "the current topic")
     q_text = question_data.get("question_text") or question_data.get("question", "")
-
+    difficulty = state.get("difficulty_level", "mid")
+    chunks = state.get("retrieved_chunks", [])
+    chunks_context = format_chunks_for_prompt(chunks)
+    
+    # Check for ASR low confidence first
+    initial_uncertainty = None
+    if asr_confidence < 0.6:
+        initial_uncertainty = "asr_low_conf"
+    
     system_prompt = (
         "<system_role>\n"
         f"You are a Staff Technical Interviewer conducting a live screening with {candidate_name}.\n"
-        "Your mission is to intelligently evaluate the candidate's conversational turn and decide the next action:\n"
-        "1. 'answer': The candidate attempted a technical answer. ACTION: 'advance'.\n"
-        "2. 'forfeit': The candidate explicitly concedes they don't know the answer or asks to skip (e.g. 'I don't know', 'no idea', 'skip this'). ACTION: 'advance'.\n"
-        "3. 'clarification': The candidate is asking for clarification, repetition, or a hint regarding the question. ACTION: 'stay'. Provide helpful, concise guidance in `interviewer_reply`.\n"
-        "4. 'smalltalk_or_greeting': The candidate is greeting or making small talk (e.g. 'hey bro how are you', 'good morning'). ACTION: 'stay'. Respond warmly and gently refocus them on the question in `interviewer_reply`.\n"
-        "5. 'noise_or_incomplete': Stray 1-2 word noise or incomplete speech fragment (e.g. 'phone', 'uh', 'testing'). ACTION: 'stay'. Prompt them gently to take their time in `interviewer_reply`.\n"
-        "6. 'end_request': The candidate explicitly asks to conclude/end the interview. ACTION: 'conclude'.\n"
+        "Your mission is to analyze the candidate's turn in ONE pass:\n"
+        "1. CLASSIFY turn_type: 'answer', 'meta_question', 'repeat_request', 'clarification', 'smalltalk', 'noise', 'end_request'\n"
+        "2. IF turn_type == 'answer': Evaluate technical quality (score 1-10, depth, correctness, relevance)\n"
+        "3. DETECT uncertainty: 'asr_low_conf', 'candidate_hedging', 'silence_timeout', 'off_topic', 'ambiguous', 'meta_question', or 'none'\n"
         "</system_role>\n\n"
+        "<turn_classification_guide>\n"
+        "- 'answer': Technical attempt at answering the question → action: 'advance'\n"
+        "- 'forfeit' (in answer): Explicit 'I don't know' → action: 'advance', score: 1\n"
+        "- 'meta_question': Question about the interview process → action: 'stay'\n"
+        "- 'repeat_request': Asking to repeat/rephrase question → action: 'stay'\n"
+        "- 'clarification': Asking for hint/clarification → action: 'stay'\n"
+        "- 'smalltalk': Greeting/pleasantry → action: 'stay'\n"
+        "- 'noise': Stray words/fragments (<3 words, no technical content) → action: 'stay'\n"
+        "- 'end_request': Wants to conclude interview → action: 'conclude'\n"
+        "</turn_classification_guide>\n\n"
+        "<evaluation_rubric>\n"
+        "Score 9-10: Exceptional mastery, precise mechanics, proactive trade-off analysis\n"
+        "Score 7-8: Strong competency, clear explanations with minor gaps\n"
+        "Score 5-6: Basic familiarity, lacks architectural depth\n"
+        "Score 3-4: Substantial gaps, incorrect claims\n"
+        "Score 1-2: Non-answer, greeting, completely incorrect\n"
+        "\n"
+        "Depth: 'deep' (nuanced understanding), 'adequate' (solid core concepts), 'insufficient' (surface-level)\n"
+        "Correctness: 'correct', 'partially_correct', 'incorrect'\n"
+        "Relevance: 'highly_relevant', 'somewhat_relevant', 'off_topic'\n"
+        "</evaluation_rubric>\n\n"
+        "<uncertainty_detection>\n"
+        "- 'asr_low_conf': Speech-to-text confidence < 0.6\n"
+        "- 'candidate_hedging': Uses phrases like 'I think', 'maybe', 'probably', 'not sure'\n"
+        "- 'silence_timeout': No response within timeout period\n"
+        "- 'off_topic': Response doesn't address the question\n"
+        "- 'ambiguous': Vague, non-committal answer\n"
+        "- 'meta_question': Candidate asking about process rather than answering\n"
+        "- 'none': Clear, confident response\n"
+        "</uncertainty_detection>\n\n"
         "<critical_rule>\n"
-        "NEVER advance the technical question counter on casual greetings, stray noise words, or clarification requests. Only advance on actual technical answers or explicit forfeits.\n"
+        "NEVER advance on smalltalk, noise, or clarification requests. Only advance on actual answers or explicit forfeits.\n"
+        "If interruption_flag is true, consider that the question may not have been fully delivered.\n"
         "</critical_rule>"
     )
-
+    
     user_prompt = (
         "<context>\n"
         f"<candidate_name>{candidate_name}</candidate_name>\n"
         f"<active_question>{q_text}</active_question>\n"
         f"<active_topic>{topic}</active_topic>\n"
+        f"<expected_difficulty>{difficulty}</expected_difficulty>\n"
+        f"<asr_confidence>{asr_confidence}</asr_confidence>\n"
+        f"<interruption_flag>{interruption_flag}</interruption_flag>\n"
         "</context>\n\n"
+        "<reference_literature>\n"
+        f"{chunks_context}\n"
+        "</reference_literature>\n\n"
+        "<ideal_criteria>\n"
+        f"{', '.join(question_data.get('ideal_points', []))}\n"
+        "</ideal_criteria>\n\n"
         "<candidate_turn>\n"
         f"{answer_text}\n"
         "</candidate_turn>\n\n"
         "<instructions>\n"
-        "Classify the candidate's turn and return the TurnDecision object.\n"
+        f"Analyze {candidate_name}'s turn and return the ClassifyAndEvaluateResult object.\n"
+        "Only fill evaluation fields (score, depth, correctness, relevance, feedback, suggested_next_difficulty) when turn_type == 'answer'.\n"
         "</instructions>"
     )
-
-    def _fallback_decision() -> TurnDecision:
+    
+    def _fallback_classify_and_evaluate() -> ClassifyAndEvaluateResult:
+        """Fallback heuristics when LLM fails."""
         t_low = answer_text.lower()
         words = t_low.split()
+        
+        # Check ASR confidence first - this overrides other logic
+        if initial_uncertainty == "asr_low_conf":
+            return ClassifyAndEvaluateResult(
+                turn_type="answer",
+                action="stay",  # Stay and ask for clarification due to poor audio
+                interviewer_reply=f"I'm having trouble hearing clearly. Could you please repeat your answer, {candidate_name}?",
+                score=None,
+                depth=None,
+                correctness=None,
+                relevance=None,
+                feedback="Audio quality too low for reliable evaluation.",
+                suggested_next_difficulty=difficulty,
+                uncertainty_type="asr_low_conf"
+            )
+        
+        # End request
         if any(w in t_low for w in ["end interview", "stop interview", "quit interview", "i want to end", "conclude session"]):
-            return TurnDecision(intent="end_request", action="conclude", interviewer_reply="Understood. Let's wrap up our interview.")
-        elif any(w in t_low for w in ["i don't know", "no idea", "i have no idea", "skip", "pass"]):
-            return TurnDecision(intent="forfeit", action="advance", interviewer_reply="No worries at all, let's move right along to the next topic.")
-        elif any(w in t_low for w in ["how are you", "what's up", "hey", "hello", "hi", "good morning"]):
-            return TurnDecision(intent="smalltalk_or_greeting", action="stay", interviewer_reply=f"I'm doing well, thank you! Whenever you're ready, let me know your thoughts on {topic}.")
-        elif len(words) <= 2 and not any(k in t_low for k in ["python", "pytorch", "loss", "model", "sql", "api", "regularization", "gradient"]):
-            return TurnDecision(intent="noise_or_incomplete", action="stay", interviewer_reply=f"Take your time! Feel free to share your approach regarding {topic}.")
+            return ClassifyAndEvaluateResult(
+                turn_type="end_request",
+                action="conclude",
+                interviewer_reply="Understood. Let's wrap up our interview.",
+                uncertainty_type="none"
+            )
+        
+        # Forfeit within answer
+        if any(w in t_low for w in ["i don't know", "no idea", "i have no idea", "skip", "pass"]):
+            return ClassifyAndEvaluateResult(
+                turn_type="answer",
+                action="advance",
+                interviewer_reply="No worries at all, let's move right along to the next topic.",
+                score=1,
+                depth="insufficient",
+                correctness="incorrect",
+                relevance="off_topic",
+                feedback=f"{candidate_name} indicated they are unfamiliar with this topic.",
+                suggested_next_difficulty=difficulty,
+                uncertainty_type="none"
+            )
+        
+        # Meta question / clarification
+        if any(w in t_low for w in ["can you repeat", "what do you mean", "could you clarify", "how does this work"]):
+            return ClassifyAndEvaluateResult(
+                turn_type="meta_question" if "why" in t_low or "what is" in t_low else "clarification",
+                action="stay",
+                interviewer_reply=f"Let me rephrase: {q_text[:100]}...",
+                uncertainty_type="meta_question"
+            )
+        
+        # Smalltalk
+        if any(w in t_low for w in ["how are you", "what's up", "hey", "hello", "hi", "good morning"]):
+            return ClassifyAndEvaluateResult(
+                turn_type="smalltalk",
+                action="stay",
+                interviewer_reply=f"I'm doing well, thank you! Whenever you're ready, let me know your thoughts on {topic}.",
+                uncertainty_type="none"
+            )
+        
+        # Noise
+        if len(words) <= 2 and not any(k in t_low for k in ["python", "pytorch", "loss", "model", "sql", "api", "regularization", "gradient"]):
+            return ClassifyAndEvaluateResult(
+                turn_type="noise",
+                action="stay",
+                interviewer_reply=f"Take your time! Feel free to share your approach regarding {topic}.",
+                uncertainty_type="none"
+            )
+        
+        # Default: treat as answer with heuristic scoring
+        length = len(words)
+        if length > 50:
+            return ClassifyAndEvaluateResult(
+                turn_type="answer",
+                action="advance",
+                interviewer_reply="",
+                score=8,
+                depth="adequate",
+                correctness="correct",
+                relevance="highly_relevant",
+                feedback=f"{candidate_name} provided a clear explanation addressing the core principles.",
+                suggested_next_difficulty=difficulty,
+                uncertainty_type="candidate_hedging" if any(w in t_low for w in ["think", "maybe", "probably"]) else "none"
+            )
+        elif length > 15:
+            return ClassifyAndEvaluateResult(
+                turn_type="answer",
+                action="advance",
+                interviewer_reply="",
+                score=5,
+                depth="insufficient",
+                correctness="partially_correct",
+                relevance="somewhat_relevant",
+                feedback="Touches on basic concepts but lacks concrete trade-offs and architectural depth.",
+                suggested_next_difficulty="junior" if difficulty == "mid" else difficulty,
+                uncertainty_type="candidate_hedging" if any(w in t_low for w in ["think", "maybe", "probably"]) else "none"
+            )
         else:
-            return TurnDecision(intent="answer", action="advance", interviewer_reply="")
-
-    decision = generate_structured(
+            return ClassifyAndEvaluateResult(
+                turn_type="answer",
+                action="advance",
+                interviewer_reply="",
+                score=2,
+                depth="insufficient",
+                correctness="incorrect",
+                relevance="off_topic",
+                feedback="Response is too brief to demonstrate technical competence.",
+                suggested_next_difficulty="junior",
+                uncertainty_type="ambiguous"
+            )
+    
+    result = generate_structured(
         prompt=user_prompt,
-        response_schema=TurnDecision,
+        response_schema=ClassifyAndEvaluateResult,
         system_instruction=system_prompt,
-        fallback_factory=_fallback_decision
+        fallback_factory=_fallback_classify_and_evaluate
     )
-
+    
+    result_dict = result.model_dump()
+    
+    # Update message history
+    message_history = list(state.get("message_history", []))
+    message_history.append({
+        "role": "candidate",
+        "content": answer_text,
+        "turn_type": result.turn_type,
+        "modality": last_turn.get("modality", "text"),
+        "timestamp": str(uuid4())[:8]  # Simple timestamp placeholder
+    })
+    
+    # Build insight entry if this was an answer
+    insight_updates = []
+    if result.turn_type == "answer" and result.score is not None:
+        insight_updates.append(InsightEntry(
+            topic=topic,
+            claim=result.feedback or "",
+            evidence=answer_text[:200],
+            observation=f"Score: {result.score}/10, Depth: {result.depth}"
+        ))
+    
     return {
-        "turn_decision": decision.model_dump()
+        "turn_decision": result_dict,
+        "answer_quality": result.score / 10.0 if result.score else None,
+        "evaluation_confidence": 0.8 if result.score else 0.5,
+        "candidate_confidence": 0.9 if result.uncertainty_type == "none" else 0.5,
+        "hedging_detected": result.hedging_detected or (result.uncertainty_type == "candidate_hedging"),
+        "question_quality_flag": True,  # Assume question was well-formed unless proven otherwise
+        "contradicts_resume_flag": result.contradicts_resume,
+        "uncertainty_type": result.uncertainty_type if result.uncertainty_type != "none" else None,
+        "message_history": message_history,
+        "insight_buffer": list(state.get("insight_buffer", [])) + insight_updates
     }
 
 

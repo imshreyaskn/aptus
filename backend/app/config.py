@@ -17,7 +17,13 @@ class Settings(BaseSettings):
     
     # Google Gemini LLM
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "AIzaSyCJOlZqGEOSqLd_LKlG3qO4UD6Cc39_Ndk")
-    GEMINI_MODEL: str = "gemini-3.6-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash-exp"
+    
+    # Groq STT (free tier)
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    
+    # Google Cloud TTS (free tier standard voice)
+    GOOGLE_CLOUD_CREDENTIALS: str = os.getenv("GOOGLE_CLOUD_CREDENTIALS", "")
     
     # Database (Async SQLite / PostgreSQL)
     DATABASE_URL: str = "sqlite+aiosqlite:///./screening.db"
