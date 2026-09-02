@@ -1,12 +1,26 @@
 // frontend/src/voice/speaker.js
-// Production-grade Google Cloud TTS player with browser SpeechSynthesis fallback.
+// High-fidelity Google Cloud TTS player powered by Web Audio API.
 import { synthesizeSpeech } from '../api';
 
 let audioQueue = [];
 let isPlaying = false;
+let globalAudioCtx = null;
+let currentSourceNode = null;
 let currentAudioElement = null;
-let currentUtterance = null;
-const activeUtterances = new Set();
+
+function getAudioContext() {
+  if (typeof window === 'undefined') return null;
+  if (!globalAudioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      globalAudioCtx = new AudioCtx();
+    }
+  }
+  if (globalAudioCtx && globalAudioCtx.state === 'suspended') {
+    globalAudioCtx.resume().catch(() => {});
+  }
+  return globalAudioCtx;
+}
 
 function sanitizeTextForSpeech(text) {
   if (!text) return '';
@@ -22,52 +36,90 @@ function sanitizeTextForSpeech(text) {
 }
 
 /**
- * Synthesizes and plays speech using Google Cloud TTS backend endpoint.
+ * Synthesizes and plays speech using Google Cloud TTS backend endpoint via Web Audio API.
  */
 async function cloudTTS(text, { onStart, onEnd } = {}) {
   const cleanText = sanitizeTextForSpeech(text);
   if (!cleanText) return;
 
   const startTime = Date.now();
-  console.log(`%c[TTS][Google Cloud] Requesting audio for: "${cleanText.slice(0, 70)}..."`, 'color: #8b5cf6; font-weight: bold;');
+  console.log(`%c[TTS][Google Cloud] Synthesizing speech: "${cleanText.slice(0, 70)}..."`, 'color: #8b5cf6; font-weight: bold;');
 
   try {
     const audioBlob = await synthesizeSpeech(cleanText);
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio(audioUrl);
-    currentAudioElement = audio;
+    const audioCtx = getAudioContext();
 
-    return new Promise((resolve) => {
-      audio.onplay = () => {
-        console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      return new Promise((resolve) => {
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        currentSourceNode = source;
+
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #10b981;');
+          if (currentSourceNode === source) {
+            currentSourceNode = null;
+          }
+          onEnd?.();
+          resolve();
+        };
+
+        source.onended = finish;
+
+        console.log(`%c[TTS][Google Cloud] Playing audio stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
         onStart?.();
-      };
-
-      const finish = () => {
-        const elapsed = Date.now() - startTime;
-        console.log(`%c[TTS][Google Cloud] Finished playback in ${elapsed}ms`, 'color: #a78bfa;');
-        URL.revokeObjectURL(audioUrl);
-        if (currentAudioElement === audio) {
-          currentAudioElement = null;
-        }
-        onEnd?.();
-        resolve();
-      };
-
-      audio.onended = finish;
-      audio.onerror = (e) => {
-        console.warn('[TTS][Google Cloud] Audio playback error, falling back:', e);
-        finish();
-      };
-
-      audio.play().catch((err) => {
-        console.warn('[TTS][Google Cloud] Audio play() prevented:', err);
-        finish();
+        source.start(0);
       });
-    });
+    } else {
+      // HTML5 Audio fallback if AudioContext is unsupported
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      currentAudioElement = audio;
+
+      return new Promise((resolve) => {
+        audio.onplay = () => {
+          console.log(`%c[TTS][Google Cloud] Playing stream (${audioBlob.size} bytes)...`, 'color: #10b981; font-weight: bold;');
+          onStart?.();
+        };
+
+        const finish = () => {
+          const elapsed = Date.now() - startTime;
+          console.log(`%c[TTS][Google Cloud] Playback complete in ${elapsed}ms`, 'color: #a78bfa;');
+          URL.revokeObjectURL(audioUrl);
+          if (currentAudioElement === audio) {
+            currentAudioElement = null;
+          }
+          onEnd?.();
+          resolve();
+        };
+
+        audio.onended = finish;
+        audio.onerror = (e) => {
+          console.warn('[TTS][Google Cloud] Audio playback error:', e);
+          finish();
+        };
+
+        audio.play().catch((err) => {
+          console.warn('[TTS][Google Cloud] Audio play() prevented:', err);
+          finish();
+        });
+      });
+    }
   } catch (err) {
-    console.warn('[TTS] Google Cloud TTS synthesis failed; falling back to browser synthesis:', err);
-    return browserTTS(text, { onStart, onEnd });
+    console.error('[TTS][Google Cloud] Synthesis error:', err);
+    onEnd?.();
   }
 }
 
@@ -220,6 +272,15 @@ export function speakText(text, options = {}) {
 export function stopAudio() {
   audioQueue = [];
   activeUtterances.clear();
+  if (currentSourceNode) {
+    try {
+      currentSourceNode.stop();
+      currentSourceNode.disconnect();
+    } catch (e) {
+      // ignore
+    }
+    currentSourceNode = null;
+  }
   if (currentAudioElement) {
     try {
       currentAudioElement.pause();
@@ -237,5 +298,6 @@ export function stopAudio() {
 }
 
 export function isAudioPlaying() {
-  return isPlaying || (typeof window !== 'undefined' && window.speechSynthesis?.speaking);
+  return isPlaying || Boolean(currentSourceNode) || (typeof window !== 'undefined' && window.speechSynthesis?.speaking);
 }
+
