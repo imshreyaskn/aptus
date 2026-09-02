@@ -1,3 +1,5 @@
+// File: frontend/src\index.css
+
 :root {
   /* Exactly 4-Value Achromatic-Warm System */
   --color-off-white: #FDFCF8;
@@ -468,3 +470,31 @@ html, body, * {
   background: transparent !important;
 }
 
+
+/* Interaction-quality baseline. Keeps the existing visual system intact. */
+:focus-visible {
+  outline: 2px solid var(--color-obsidian-100, #111);
+  outline-offset: 3px;
+}
+
+button,
+input {
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@media (max-width: 640px) {
+  html {
+    overflow-x: hidden;
+  }
+}

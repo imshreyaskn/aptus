@@ -1,3 +1,5 @@
+// File: frontend/src\components\LandingScreen.jsx
+
 import React, { useState, useEffect } from 'react';
 
 const CATCHPHRASES = [
@@ -130,7 +132,6 @@ export default function LandingScreen({ onGetStarted }) {
 
           <button
             type="submit"
-            onClick={handleSubmit}
             className="btn-liquid-glass"
             style={{
               padding: '8px 20px',

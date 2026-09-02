@@ -1,3 +1,5 @@
+// File: frontend/src\components\TraceabilityModal.jsx
+
 import React from 'react';
 import { X, Bookmark, BookOpen } from 'lucide-react';
 

@@ -1,3 +1,5 @@
+// File: frontend/src\App.jsx
+
 import React, { useState } from 'react';
 import LandingScreen from './components/LandingScreen';
 import SetupScreen from './components/SetupScreen';
@@ -33,7 +35,9 @@ function App() {
   // 1. Start Interview Handler
   const handleStartInterview = async ({ name, role, resumeText: rt, resumeFile }) => {
     setIsStarting(true);
-    if (rt) setResumeText(rt); // lift for interview agent context
+    if (name) setCandidateName(name);
+    if (role) setSelectedRole(role);
+    setResumeText(rt || '');
     try {
       const data = await startInterview({
         name: name || candidateName || 'Candidate',
@@ -58,6 +62,9 @@ function App() {
       } else {
         throw new Error('No question generated for session.');
       }
+    } catch (error) {
+      console.error('[Aptus] Failed to start interview:', error);
+      throw error;
     } finally {
       setIsStarting(false);
     }
@@ -188,4 +195,3 @@ function App() {
 }
 
 export default App;
-

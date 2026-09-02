@@ -1,3 +1,5 @@
+// File: frontend/src\components\SetupScreen.jsx
+
 import React, { useState } from 'react';
 import { AlertCircle, ArrowLeft, ArrowRight, Upload, Check, FileText } from 'lucide-react';
 
