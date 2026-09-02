@@ -63,13 +63,19 @@ def get_gemini_model():
         return None
 
 
-def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
+def transcribe_audio_groq(
+    audio_bytes: bytes,
+    language: str = "en",
+    filename: Optional[str] = None
+) -> dict:
     """
-    Transcribes audio using Groq's free STT API.
+    Transcribes audio using Groq's free STT API (whisper-large-v3-turbo).
+    Supports all media formats (webm, opus, ogg, wav, mp3, mp4, m4a).
     
     Args:
-        audio_bytes: Raw audio data (WAV format preferred)
+        audio_bytes: Raw audio data
         language: Language code for transcription
+        filename: Optional source filename with extension
         
     Returns:
         dict with keys:
@@ -86,22 +92,32 @@ def transcribe_audio_groq(audio_bytes: bytes, language: str = "en") -> dict:
         logger.warning("[STT][Groq Whisper] GROQ_API_KEY is not set. STT will fail.")
         return {"text": "", "confidence": 0.0, "error": "GROQ_API_KEY not configured"}
     
+    # Auto-detect audio container format from magic bytes if not specified
+    if not filename or filename.endswith(".bin"):
+        if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+            filename = "recording.webm"
+        elif audio_bytes[:4] == b"OggS":
+            filename = "recording.ogg"
+        elif audio_bytes[:4] == b"RIFF":
+            filename = "recording.wav"
+        elif audio_bytes[:3] == b"ID3" or (len(audio_bytes) > 2 and audio_bytes[0] == 0xff and (audio_bytes[1] & 0xe0) == 0xe0):
+            filename = "recording.mp3"
+        elif len(audio_bytes) > 8 and audio_bytes[4:8] == b"ftyp":
+            filename = "recording.mp4"
+        else:
+            filename = "recording.webm"
+
     try:
         from groq import Groq
         
         client = Groq(api_key=groq_api_key)
         
-        # Groq requires file-like object, so we use BytesIO
-        import io
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "audio.wav"  # Hint the file type
-        
-        logger.info("[STT][Groq Whisper] Dispatching transcription request to whisper-large-v3-turbo...")
+        logger.info(f"[STT][Groq Whisper] Dispatching transcription to whisper-large-v3-turbo (format: {filename})...")
         transcription = client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3-turbo",  # Groq's free whisper model
+            file=(filename, audio_bytes),
+            model="whisper-large-v3-turbo",
             language=language,
-            response_format="verbose_json"  # Gets confidence and segments
+            response_format="verbose_json"
         )
         
         elapsed_ms = (time.time() - start_time) * 1000

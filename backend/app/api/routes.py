@@ -82,7 +82,8 @@ async def speech_to_text(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio payload received.")
     
-    result = transcribe_audio_groq(audio_bytes, language=language)
+    orig_filename = audio.filename or "recording.webm"
+    result = transcribe_audio_groq(audio_bytes, language=language, filename=orig_filename)
     if result.get("error") and not result.get("text"):
         logger.warning(f"[STT Route] Groq STT returned error: {result.get('error')}")
         raise HTTPException(status_code=500, detail=result.get("error", "Transcription failed."))
